@@ -1,10 +1,10 @@
 """
-Analysis Orchestrator: coordinates L1, L2, and L3 analysis layers.
+Analysis Orchestrator for ClickHouse (orchestrator_ck.py).
 
+Coordinates L1, L2, and L3 analysis layers against a ClickHouse backend.
 Each analysis run is assigned a unique run_id (UUID). Every analysis case
-(L1, L2-1 through L2-8, L3) writes its result as a separate row in the
-openclaw_analysis_results table, linked by run_id. Reports can be generated
-by querying all rows for a given run_id.
+writes its result as a separate row in the openclaw_analysis_results table,
+linked by run_id.
 """
 
 from __future__ import annotations
@@ -17,18 +17,18 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from scripts.config import AppConfig
-from scripts.db import execute_batch_insert, execute_query
+from scripts.config_ck import AppConfigCk
+from scripts.db_ck import execute_batch_insert, execute_ddl, execute_query, close_connection_pool
 from scripts.llm_client import LlmClient
 from scripts.types import TimeRange, last_n_days_range
-from scripts.analysis.operational_insight import (
+from scripts.analysis.operational_insight_ck import (
     analyze_token_efficiency,
     analyze_session_depth,
     analyze_tool_chains,
     analyze_high_cost_sessions,
     analyze_anomalies,
 )
-from scripts.analysis.behavior_insight import (
+from scripts.analysis.behavior_insight_ck import (
     classify_intents,
     assess_task_complexity,
     estimate_task_success_rate,
@@ -38,7 +38,7 @@ from scripts.analysis.behavior_insight import (
     analyze_thinking_depth,
     track_user_maturity,
 )
-from scripts.analysis.organizational_insight import run_l3_analysis, generate_narrative_report
+from scripts.analysis.organizational_insight_ck import run_l3_analysis, generate_narrative_report
 from scripts.analysis.insight_logic_docs import generate_insight_logic_doc
 
 RESULTS_TABLE = "openclaw_analysis_results"
@@ -49,26 +49,27 @@ def _detect_language(text: str) -> str:
     chinese_chars = sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
     return "zh" if chinese_chars > 50 else "en"
 
-CREATE_RESULTS_TABLE_SQL = f"""
-CREATE TABLE IF NOT EXISTS `{RESULTS_TABLE}` (
-    row_id BIGINT NOT NULL AUTO_INCREMENT,
-    run_id VARCHAR(36) NOT NULL COMMENT 'Unique ID for each analysis run (UUID)',
-    case_name VARCHAR(100) NOT NULL COMMENT 'Analysis case name, e.g. L1, L2-1, L2-2, ..., L3',
-    analysis_type VARCHAR(50) NOT NULL COMMENT 'L1_OPERATIONAL / L2_BEHAVIOR / L3_ORGANIZATIONAL',
-    status VARCHAR(20) NOT NULL DEFAULT 'success' COMMENT 'success / failure / skipped',
-    elapsed_seconds DOUBLE DEFAULT NULL COMMENT 'Execution time in seconds',
-    time_range_start VARCHAR(30) DEFAULT NULL COMMENT 'Analysis window start timestamp',
-    time_range_end VARCHAR(30) DEFAULT NULL COMMENT 'Analysis window end timestamp',
-    summary TEXT DEFAULT NULL COMMENT 'Human-readable summary of the result',
-    details LONGTEXT NOT NULL COMMENT 'Full analysis result JSON',
-    error_message TEXT DEFAULT NULL COMMENT 'Error message if status is failure',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (row_id),
-    INDEX idx_run_id (run_id),
-    INDEX idx_case_name (case_name),
-    INDEX idx_analysis_type (analysis_type)
+# ClickHouse DDL for the analysis results table
+_CREATE_RESULTS_TABLE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {RESULTS_TABLE} (
+    row_id          UInt64                    COMMENT 'Python-generated monotonic ID',
+    run_id          String                    COMMENT 'Unique ID for each analysis run (UUID)',
+    case_name       String                    COMMENT 'Analysis case name, e.g. L1, L2-1, L2-2, ..., L3',
+    analysis_type   String                    COMMENT 'L1_OPERATIONAL / L2_BEHAVIOR / L3_ORGANIZATIONAL / FINAL_REPORT',
+    status          String  DEFAULT 'success' COMMENT 'success / failure / skipped',
+    elapsed_seconds Nullable(Float64)         COMMENT 'Execution time in seconds',
+    time_range_start Nullable(String)         COMMENT 'Analysis window start timestamp',
+    time_range_end  Nullable(String)          COMMENT 'Analysis window end timestamp',
+    summary         Nullable(String)          COMMENT 'Human-readable summary of the result',
+    details         String                    COMMENT 'Full analysis result JSON',
+    error_message   Nullable(String)          COMMENT 'Error message if status is failure',
+    created_at      DateTime DEFAULT now()
 )
+ENGINE = MergeTree()
+ORDER BY (created_at, run_id, case_name)
+SETTINGS index_granularity = 8192
 """
+
 
 # ─── Summarizers for each case ───
 
@@ -145,6 +146,7 @@ def _summarize_l2_4(result: dict) -> str:
     bottom_info = f", Worst3: {', '.join(u['senderId'][:12] for u in bottom_users)}" if bottom_users else ""
     return f"共 {user_count} 个用户, 团队平均 Prompt 质量分 {overall:.2f}{top_info}{bottom_info}"
 
+
 def _summarize_l2_5(result: dict) -> str:
     cat_dist = result.get("categoryDistribution", {})
     total = sum(cat_dist.values())
@@ -152,17 +154,20 @@ def _summarize_l2_5(result: dict) -> str:
     cat_parts = [f"{k}={v}" for k, v in sorted(cat_dist.items(), key=lambda x: x[1], reverse=True)[:5]]
     return f"共 {total} 条消息, {len(cat_dist)} 个分类, {len(top_tags)} 个标签. Top分类: {', '.join(cat_parts)}"
 
+
 def _summarize_l2_6(result: dict) -> str:
     total = result.get("totalSessions", 0)
     retry_count = result.get("retrySessionCount", 0)
     rate = result.get("retryRate", 0)
     return f"共 {total} 个 session, {retry_count} 个有重试行为, 重试率 {rate:.1f}%"
 
+
 def _summarize_l2_7(result: dict) -> str:
     dist = result.get("distribution", {})
     total = sum(dist.values())
     parts = [f"{k}={v}" for k, v in dist.items()]
     return f"共 {total} 个 task chain. 思考深度分布: {', '.join(parts)}"
+
 
 def _summarize_l2_8(result: dict) -> str:
     users = result.get("users", [])
@@ -192,10 +197,10 @@ _SUMMARIZERS = {
 }
 
 
-class AnalysisOrchestrator:
-    def __init__(self, config: AppConfig) -> None:
+class AnalysisOrchestratorCk:
+    def __init__(self, config: AppConfigCk) -> None:
         self._config = config
-        self._table_name = config.adb.session_table
+        self._table_name = config.ck.session_table
         self._results_table_ensured = False
 
     async def run_full_analysis(self, range_: TimeRange | None = None) -> str:
@@ -203,21 +208,21 @@ class AnalysisOrchestrator:
         run_id = str(uuid.uuid4())
 
         print("\n" + "=" * 60)
-        print("🔍 Starting Full Analysis")
+        print("🔍 Starting Full Analysis (ClickHouse)")
         print("=" * 60)
 
         analysis_config = self._config.analysis
         if not analysis_config:
-            print("[Orchestrator] Analysis config not found, skipping analysis")
+            print("[Orchestrator-CK] Analysis config not found, skipping analysis")
             return run_id
 
         analysis_range = range_ or last_n_days_range(analysis_config.analysis_window_days)
 
-        print(f"[Orchestrator] Run ID: {run_id}")
-        print(f"[Orchestrator] Time range: {analysis_range.start_date} to {analysis_range.end_date}")
-        print(f"[Orchestrator] L1 enabled: {analysis_config.enable_l1}")
-        print(f"[Orchestrator] L2 enabled: {analysis_config.enable_l2}")
-        print(f"[Orchestrator] L3 enabled: {analysis_config.enable_l3}")
+        print(f"[Orchestrator-CK] Run ID: {run_id}")
+        print(f"[Orchestrator-CK] Time range: {analysis_range.start_date} to {analysis_range.end_date}")
+        print(f"[Orchestrator-CK] L1 enabled: {analysis_config.enable_l1}")
+        print(f"[Orchestrator-CK] L2 enabled: {analysis_config.enable_l2}")
+        print(f"[Orchestrator-CK] L3 enabled: {analysis_config.enable_l3}")
 
         self._ensure_results_table()
 
@@ -227,38 +232,38 @@ class AnalysisOrchestrator:
         l2_results: dict | None = None
 
         try:
-            # ── L1 (each sub-case independently) ──
+            # ── L1 ──
             if analysis_config.enable_l1:
-                adb = self._config.adb
+                ck = self._config.ck
                 table = self._table_name
 
                 l1_case_results = {}
                 l1_case_results["tokenEfficiency"] = await self._run_and_save_case(
                     run_id, "L1-1", "L1_OPERATIONAL", analysis_range,
-                    analyze_token_efficiency, (adb, table, analysis_range),
+                    analyze_token_efficiency, (ck, table, analysis_range),
                 )
                 l1_case_results["sessionDepth"] = await self._run_and_save_case(
                     run_id, "L1-2", "L1_OPERATIONAL", analysis_range,
-                    analyze_session_depth, (adb, table, analysis_range),
+                    analyze_session_depth, (ck, table, analysis_range),
                 )
                 l1_case_results["toolChains"] = await self._run_and_save_case(
                     run_id, "L1-3", "L1_OPERATIONAL", analysis_range,
-                    analyze_tool_chains, (adb, table, analysis_range),
+                    analyze_tool_chains, (ck, table, analysis_range),
                 )
                 l1_case_results["highCostSessions"] = await self._run_and_save_case(
                     run_id, "L1-4", "L1_OPERATIONAL", analysis_range,
-                    analyze_high_cost_sessions, (adb, table, analysis_range),
+                    analyze_high_cost_sessions, (ck, table, analysis_range),
                 )
                 l1_case_results["anomalies"] = await self._run_and_save_case(
                     run_id, "L1-5", "L1_OPERATIONAL", analysis_range,
-                    analyze_anomalies, (adb, table, analysis_range),
+                    analyze_anomalies, (ck, table, analysis_range),
                 )
                 l1_results = {k: v for k, v in l1_case_results.items() if v is not None}
 
-            # ── L2 (each sub-case in order L2-1 through L2-8) ──
+            # ── L2 ──
             if analysis_config.enable_l2:
                 max_items = analysis_config.max_sessions_for_llm
-                adb = self._config.adb
+                ck = self._config.ck
                 table = self._table_name
 
                 l2_case_results = {}
@@ -267,63 +272,62 @@ class AnalysisOrchestrator:
                 if llm_client:
                     l2_case_results["intents"] = await self._run_and_save_case(
                         run_id, "L2-1", "L2_BEHAVIOR", analysis_range,
-                        classify_intents, (adb, table, analysis_range, llm_client, max_items),
+                        classify_intents, (ck, table, analysis_range, llm_client, max_items),
                     )
                 else:
-                    print("[Orchestrator] ⚠️ L2-1 skipped: requires LLM config")
+                    print("[Orchestrator-CK] ⚠️ L2-1 skipped: requires LLM config")
 
                 # L2-2: Task Complexity (SQL)
                 l2_case_results["complexity"] = await self._run_and_save_case(
                     run_id, "L2-2", "L2_BEHAVIOR", analysis_range,
-                    assess_task_complexity, (adb, table, analysis_range),
+                    assess_task_complexity, (ck, table, analysis_range),
                 )
 
                 # L2-3: Task Success Rate (SQL)
                 l2_case_results["successRate"] = await self._run_and_save_case(
                     run_id, "L2-3", "L2_BEHAVIOR", analysis_range,
-                    estimate_task_success_rate, (adb, table, analysis_range),
+                    estimate_task_success_rate, (ck, table, analysis_range),
                 )
 
                 # L2-4: Prompt Quality (LLM)
                 if llm_client:
                     l2_case_results["promptQuality"] = await self._run_and_save_case(
                         run_id, "L2-4", "L2_BEHAVIOR", analysis_range,
-                        score_prompt_quality, (adb, table, analysis_range, llm_client),
+                        score_prompt_quality, (ck, table, analysis_range, llm_client),
                     )
                 else:
-                    print("[Orchestrator] ⚠️ L2-4 skipped: requires LLM config")
+                    print("[Orchestrator-CK] ⚠️ L2-4 skipped: requires LLM config")
 
                 # L2-5: Topic Clustering (LLM)
                 if llm_client:
                     l2_case_results["topics"] = await self._run_and_save_case(
                         run_id, "L2-5", "L2_BEHAVIOR", analysis_range,
-                        cluster_topics, (adb, table, analysis_range, llm_client),
+                        cluster_topics, (ck, table, analysis_range, llm_client),
                     )
                 else:
-                    print("[Orchestrator] ⚠️ L2-5 skipped: requires LLM config")
+                    print("[Orchestrator-CK] ⚠️ L2-5 skipped: requires LLM config")
 
                 # L2-6: Retry Behavior (SQL)
                 l2_case_results["retryBehavior"] = await self._run_and_save_case(
                     run_id, "L2-6", "L2_BEHAVIOR", analysis_range,
-                    detect_retry_behavior, (adb, table, analysis_range),
+                    detect_retry_behavior, (ck, table, analysis_range),
                 )
 
                 # L2-7: Thinking Depth (SQL)
                 l2_case_results["thinkingDepth"] = await self._run_and_save_case(
                     run_id, "L2-7", "L2_BEHAVIOR", analysis_range,
-                    analyze_thinking_depth, (adb, table, analysis_range),
+                    analyze_thinking_depth, (ck, table, analysis_range),
                 )
 
                 # L2-8: User Maturity (LLM)
                 if llm_client:
                     l2_case_results["userMaturity"] = await self._run_and_save_case(
                         run_id, "L2-8", "L2_BEHAVIOR", analysis_range,
-                        track_user_maturity, (adb, table, analysis_range, llm_client),
+                        track_user_maturity, (ck, table, analysis_range, llm_client),
                     )
                 else:
-                    print("[Orchestrator] ⚠️ L2-8 skipped: requires LLM config")
+                    print("[Orchestrator-CK] ⚠️ L2-8 skipped: requires LLM config")
 
-                # Assemble combined L2 results for L3 consumption
                 l2_results = {k: v for k, v in l2_case_results.items() if v is not None}
 
             # ── L3 ──
@@ -332,12 +336,12 @@ class AnalysisOrchestrator:
                 l3_results = await self._run_and_save_case(
                     run_id, "L3", "L3_ORGANIZATIONAL", analysis_range,
                     run_l3_analysis, (
-                        self._config.adb, self._table_name, analysis_range,
+                        self._config.ck, self._table_name, analysis_range,
                         llm_client, l1_results, l2_results,
                     ),
                 )
             elif analysis_config.enable_l3:
-                print("[Orchestrator] ⚠️ L3 Analysis skipped: requires LLM config and L1/L2 results")
+                print("[Orchestrator-CK] ⚠️ L3 Analysis skipped: requires LLM config and L1/L2 results")
 
             # ── Final Report (L3-5) ──
             final_report_text: str = ""
@@ -348,15 +352,14 @@ class AnalysisOrchestrator:
                 )
 
         except Exception as error:
-            print(f"[Orchestrator] ❌ Analysis failed: {error}")
+            print(f"[Orchestrator-CK] ❌ Analysis failed: {error}")
             raise
 
         print("\n" + "=" * 60)
-        print("🎉 Full Analysis Completed")
+        print("🎉 Full Analysis Completed (ClickHouse)")
         print(f"   Run ID: {run_id}")
         print("=" * 60)
 
-        # Auto-generate report
         self.generate_report(run_id)
 
         try:
@@ -364,17 +367,17 @@ class AnalysisOrchestrator:
             doc_path = await generate_insight_logic_doc(
                 run_id=run_id,
                 range_=analysis_range,
-                stack="ADB",
+                stack="ClickHouse",
                 l1_results=l1_results,
                 l2_results=l2_results,
                 l3_results=l3_results,
-                output_dir=Path("output") / run_id,
                 llm_client=llm_client,
+                output_dir=Path("output") / run_id,
                 language=doc_lang,
             )
-            print(f"[Orchestrator] Insight metrics logic document updated → {doc_path}")
+            print(f"[Orchestrator-CK] Insight metrics logic document updated → {doc_path}")
         except Exception as error:
-            print(f"[Orchestrator] ⚠️ Failed to generate insight logic doc: {error}")
+            print(f"[Orchestrator-CK] ⚠️ Failed to generate insight logic doc: {error}")
 
         return run_id
 
@@ -394,7 +397,6 @@ class AnalysisOrchestrator:
         start = time.time()
         try:
             raw_result = analysis_fn(*args)
-            # Support both sync and async analysis functions
             if asyncio.iscoroutine(raw_result):
                 result = await raw_result
             else:
@@ -439,12 +441,11 @@ class AnalysisOrchestrator:
         details: dict,
         error_message: Optional[str] = None,
     ) -> None:
-        """Save a single case result to both local file and DB (synchronous)."""
+        """Save a single case result to both local file and ClickHouse DB."""
         details_json = json.dumps(details, ensure_ascii=False, default=str)
         json_size_kb = len(details_json.encode("utf-8")) / 1024
         print(f"[{case_name}] details JSON size: {json_size_kb:.1f} KB")
 
-        # Truncate details if too large for DB (max ~16MB for LONGTEXT, but keep reasonable)
         max_json_bytes = 4 * 1024 * 1024  # 4 MB
         if len(details_json.encode("utf-8")) > max_json_bytes:
             print(f"[{case_name}] ⚠️ details JSON too large ({json_size_kb:.0f} KB), truncating")
@@ -453,26 +454,25 @@ class AnalysisOrchestrator:
                 ensure_ascii=False,
             )
 
-        # Save to local file
         self._save_to_local_file(run_id, case_name, details_json)
 
-        # Save to DB
         try:
-            print(f"[{case_name}] Writing to DB...")
+            print(f"[{case_name}] Writing to CK DB...")
+            row_id = int(time.time() * 1_000_000)
             columns = [
-                "run_id", "case_name", "analysis_type", "status",
+                "row_id", "run_id", "case_name", "analysis_type", "status",
                 "elapsed_seconds", "time_range_start", "time_range_end",
                 "summary", "details", "error_message",
             ]
             rows = [[
-                run_id, case_name, analysis_type, status,
+                row_id, run_id, case_name, analysis_type, status,
                 round(elapsed, 2), range_.start_date, range_.end_date,
                 summary, details_json, error_message,
             ]]
-            execute_batch_insert(self._config.adb, RESULTS_TABLE, columns, rows)
-            print(f"[{case_name}] DB write completed")
+            execute_batch_insert(self._config.ck, RESULTS_TABLE, columns, rows)
+            print(f"[{case_name}] CK DB write completed")
         except Exception as error:
-            print(f"[Orchestrator] ⚠️ Failed to save {case_name} to DB: {error}")
+            print(f"[Orchestrator-CK] ⚠️ Failed to save {case_name} to CK DB: {error}")
 
     def _save_to_local_file(self, run_id: str, case_name: str, details_json: str) -> None:
         try:
@@ -481,16 +481,16 @@ class AnalysisOrchestrator:
             filename = output_dir / f"{case_name}.json"
             filename.write_text(details_json, encoding="utf-8")
         except Exception as error:
-            print(f"[Orchestrator] ⚠️ Failed to save {case_name} to local file: {error}")
+            print(f"[Orchestrator-CK] ⚠️ Failed to save {case_name} to local file: {error}")
 
     def _ensure_results_table(self) -> None:
         if self._results_table_ensured:
             return
         try:
-            execute_query(self._config.adb, CREATE_RESULTS_TABLE_SQL)
+            execute_ddl(self._config.ck, _CREATE_RESULTS_TABLE_SQL)
             self._results_table_ensured = True
         except Exception as error:
-            print(f"[Orchestrator] ⚠️ Failed to ensure results table: {error}")
+            print(f"[Orchestrator-CK] ⚠️ Failed to ensure results table: {error}")
 
     async def _generate_final_report(
         self,
@@ -501,7 +501,7 @@ class AnalysisOrchestrator:
         l2_results: dict,
         l3_results: dict,
     ) -> str:
-        """Generate the final narrative report (L3-5), write to DB and final_report.md.
+        """Generate the final narrative report (L3-5), write to CK DB and final_report.md.
 
         Returns the report text so the caller can detect its language.
         """
@@ -521,14 +521,12 @@ class AnalysisOrchestrator:
             report_text = result.get("report", "")
             summary = f"最终报告已生成，共 {len(report_text)} 字符"
 
-            # Save to DB (details stores the full report text as JSON)
             self._save_case_result(
                 run_id, "L3-5", "FINAL_REPORT", range_,
                 status="success", elapsed=elapsed, summary=summary,
                 details={"report": report_text},
             )
 
-            # Write to fixed local file
             report_path = Path("output") / "final_report.md"
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report_path.write_text(report_text, encoding="utf-8")
@@ -548,7 +546,7 @@ class AnalysisOrchestrator:
             return ""
 
     def get_final_report(self) -> str:
-        """Query the latest final narrative report from DB and return it."""
+        """Query the latest final narrative report from CK DB and return it."""
         sql = f"""
             SELECT details
             FROM `{RESULTS_TABLE}`
@@ -556,7 +554,7 @@ class AnalysisOrchestrator:
             ORDER BY created_at DESC
             LIMIT 1
         """
-        rows = execute_query(self._config.adb, sql)
+        rows = execute_query(self._config.ck, sql)
 
         if not rows:
             return "❌ No final report found in database. Please run analysis first."
@@ -574,7 +572,7 @@ class AnalysisOrchestrator:
             WHERE run_id = %s
             ORDER BY case_name
         """
-        rows = execute_query(self._config.adb, sql, (run_id,))
+        rows = execute_query(self._config.ck, sql, (run_id,))
 
         if not rows:
             print(f"❌ No results found for run_id: {run_id}")
@@ -588,7 +586,7 @@ class AnalysisOrchestrator:
         failure_count = sum(1 for r in rows if r.get("status") == "failure")
 
         print("\n" + "=" * 70)
-        print("📊 OpenClaw Insight Analysis Report")
+        print("📊 OpenClaw Insight Analysis Report (ClickHouse)")
         print("=" * 70)
         print(f"  Run ID:      {run_id}")
         print(f"  Time Range:  {time_start} → {time_end}")

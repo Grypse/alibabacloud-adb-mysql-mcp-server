@@ -31,26 +31,28 @@ else:
 
     builtins.print = _flushed_print
 
+
 async def main() -> None:
     from concurrent.futures import ThreadPoolExecutor
     loop = asyncio.get_running_loop()
     loop.set_default_executor(ThreadPoolExecutor(max_workers=32))
-    from scripts.config import load_config
-    from scripts.collect_logs import collect_logs
-    from scripts.analyze_usage import run_full_analysis
+
+    from scripts.config_ck import load_config_ck
+    from scripts.collect_logs_ck import collect_logs
+    from scripts.analyze_usage_ck import run_full_analysis
     from scripts.analysis.insight_logic_docs import get_insight_logic_doc
-    from scripts.db import close_connection_pool
+    from scripts.db_ck import close_connection_pool
 
     print("=" * 60)
-    print("🚀 OpenClaw Logger ADB Skill Starting")
+    print("🚀 OpenClaw Logger ClickHouse Skill Starting")
     print(f"Start time: {datetime.now().isoformat()}")
     print("=" * 60)
 
-    config = load_config()
+    config = load_config_ck()
 
-    print("\n📋 Configuration:")
-    print(f"  ADB address: {config.adb.host}:{config.adb.port}/{config.adb.database}")
-    print(f"  Session table: {config.adb.session_table}")
+    print("\n📋 Configuration (ClickHouse):")
+    print(f"  CK address: {config.ck.host}:{config.ck.port}/{config.ck.database}")
+    print(f"  Session table: {config.ck.session_table}")
     print(f"  Collection interval: {config.collection.interval_minutes} minutes")
     print(f"  Batch size: {config.collection.batch_size}")
     print(f"  Data retention: {config.collection.retention_days} days")
@@ -60,19 +62,19 @@ async def main() -> None:
     command = sys.argv[1] if len(sys.argv) > 1 else "serve"
 
     if command == "collect":
-        print("\n📥 Running one-time log collection...")
+        print("\n📥 Running one-time log collection (ClickHouse)...")
         await collect_logs(config)
         close_connection_pool()
 
     elif command == "analyze":
-        print("\n📊 Running one-time usage analysis...")
+        print("\n📊 Running one-time usage analysis (ClickHouse)...")
         await run_full_analysis(config)
         close_connection_pool()
 
     elif command == "final-report":
-        print("\n📄 Fetching latest final narrative report from database...")
-        from scripts.analysis.orchestrator import AnalysisOrchestrator
-        orchestrator = AnalysisOrchestrator(config)
+        print("\n📄 Fetching latest final narrative report from ClickHouse database...")
+        from scripts.analysis.orchestrator_ck import AnalysisOrchestratorCk
+        orchestrator = AnalysisOrchestratorCk(config)
         report_text = orchestrator.get_final_report()
         print(report_text)
         close_connection_pool()
@@ -85,17 +87,19 @@ async def main() -> None:
     else:
         # serve mode (default)
         if config.collection.enable_log_collection:
-            print("\n📥 Running initial log collection...")
+            print("\n📥 Running initial log collection (ClickHouse)...")
             try:
                 inserted_count = await collect_logs(config)
                 print(f"Initial collection completed, inserted {inserted_count} records")
             except Exception as error:
                 print(f"Initial collection failed (will retry on next scheduled run): {error}")
 
-        from scripts.scheduler import start_scheduler
-        scheduler = start_scheduler(config)
+        from scripts.scheduler_ck import start_scheduler_ck
+        # Scheduler expects an AppConfig-like object with collection/adb attributes.
+        # For CK we wrap the config so the scheduler can read interval_minutes.
+        scheduler = start_scheduler_ck(config)
 
-        print("\n✅ Service started, press Ctrl+C to exit")
+        print("\n✅ Service started (ClickHouse), press Ctrl+C to exit")
 
         def graceful_shutdown(signum, frame) -> None:
             print("\n🛑 Received shutdown signal, gracefully shutting down...")

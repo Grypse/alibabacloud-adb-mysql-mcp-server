@@ -1,7 +1,14 @@
 """
-OpenClaw session and log file collector.
-Scans JSONL session files and daily log files, parses them, and inserts into ADB MySQL.
-Supports incremental collection via a state file tracking line offsets.
+OpenClaw session and log file collector — ClickHouse edition.
+
+Adapts collect_logs.py for ClickHouse storage:
+  - Uses db_ck (clickhouse-connect) instead of db (mysql-connector)
+  - row_id is generated in Python (time-based monotonic UInt64) since ClickHouse
+    has no AUTO_INCREMENT concept
+  - Timestamps are always converted to Asia/Shanghai (matching the DateTime64
+    column definition) — no need to query the DB for its timezone
+  - Data cleanup uses ALTER TABLE ... DELETE (ClickHouse mutation) instead of
+    a standard DELETE statement
 """
 
 from __future__ import annotations
@@ -11,20 +18,24 @@ import json
 import os
 import re
 import socket
-from datetime import datetime
+import threading
+import time
+from datetime import datetime, timedelta
 from typing import Any, Optional
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
-from scripts.config import AppConfig
-from scripts.db import SqlValue, execute_batch_insert, execute_query
+from scripts.config_ck import AppConfigCk
+from scripts.db_ck import SqlValue, execute_batch_insert, execute_query
 
 # ─── Constants ───
 
-STATE_FILE_NAME = ".collect_state.json"
+STATE_FILE_NAME = ".collect_state_ck.json"
 LOG_DIRECTORY = "/tmp/openclaw"
 LOG_FILE_PATTERN = re.compile(r"^openclaw-\d{4}-\d{2}-\d{2}\.log$")
 
+# ClickHouse sessions table columns (row_id prepended, generated in Python)
 SESSION_COLUMNS = [
+    "row_id",
     "session_id", "type", "id", "parent_id", "timestamp", "hostname", "sender_id",
     "complete_session", "role", "model", "api", "provider", "stop_reason",
     "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
@@ -32,7 +43,9 @@ SESSION_COLUMNS = [
     "is_error", "content_text", "content_length", "thinking_text",
 ]
 
+# ClickHouse logs table columns (id prepended)
 LOG_COLUMNS = [
+    "id",
     "timestamp", "level", "subsystem", "raw_field_0", "raw_field_1", "raw_field_2",
     "meta_runtime", "meta_runtime_version", "hostname", "meta_name", "meta_parent_names",
     "meta_date", "meta_log_level_id", "meta_log_level_name", "meta_path", "complete_log",
@@ -40,49 +53,48 @@ LOG_COLUMNS = [
 
 LEVEL_MAP = {0: "silly", 1: "trace", 2: "debug", 3: "info", 4: "warn", 5: "error", 6: "fatal"}
 
+# ─── Timezone (fixed to Asia/Shanghai matching DateTime64 column definition) ───
 
-# ─── Timezone Utilities ───
+_CK_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
-_DEFAULT_TIMEZONE = "Asia/Shanghai"
 
-def _fetch_adb_timezone(config: AppConfig) -> ZoneInfo:
-    """
-    Query ADB for its current timezone setting via SELECT current_timezone().
-    Falls back to Asia/Shanghai (UTC+8) if the query fails or returns an unrecognized zone.
-    """
-    try:
-        rows = execute_query(config.adb, "SELECT current_timezone() AS tz")
-        tz_name = rows[0].get("tz") if rows else None
-        if tz_name and isinstance(tz_name, str):
-            try:
-                zone = ZoneInfo(tz_name)
-                print(f"[Collect] ADB timezone: {tz_name}")
-                return zone
-            except ZoneInfoNotFoundError:
-                print(f"[Collect] Unrecognized ADB timezone '{tz_name}', falling back to {_DEFAULT_TIMEZONE}")
-    except Exception as exc:
-        print(f"[Collect] Failed to query ADB timezone ({exc}), falling back to {_DEFAULT_TIMEZONE}")
-    return ZoneInfo(_DEFAULT_TIMEZONE)
+def _get_ck_timezone() -> ZoneInfo:
+    """Return the timezone used for ClickHouse DateTime64 columns (always Asia/Shanghai)."""
+    return _CK_TIMEZONE
+
+
+# ─── Monotonic row_id Generator ───
+#
+# ClickHouse has no AUTO_INCREMENT.  We generate a time-based UInt64 that is:
+#   - Globally unique across restarts (high bits = microsecond timestamp)
+#   - Monotonically increasing within a process (low bits = counter)
+#
+# Formula:  base = int(time.time() * 1_000_000) * 10_000
+#           id   = base + per_session_counter (max 9999 IDs per microsecond)
+
+_row_id_lock = threading.Lock()
+_row_id_base = int(time.time() * 1_000_000) * 10_000
+_row_id_counter: list[int] = [0]
+
+
+def _next_row_id() -> int:
+    with _row_id_lock:
+        _row_id_counter[0] += 1
+        return _row_id_base + _row_id_counter[0]
+
+
+# ─── Timestamp Conversion (reused from collect_logs.py) ───
 
 def _convert_iso_timestamp(iso_timestamp: str, target_tz: ZoneInfo) -> str:
-    """
-    Convert an ISO 8601 timestamp string to a MySQL DATETIME(3) string in the target timezone.
-
-    Handles both UTC suffix ("Z") and explicit timezone offsets ("+08:00"):
-      - "2026-03-08T05:13:46.463Z"         → parsed as UTC, then converted to target_tz
-      - "2026-03-11T10:54:24.111+08:00"    → parsed with its own offset, then converted to target_tz
-
-    Python's datetime.fromisoformat() natively supports both forms (Python 3.7+).
-    """
+    """Convert an ISO 8601 timestamp string to a DATETIME string in the target timezone."""
     try:
-        # Replace trailing "Z" with "+00:00" so fromisoformat() handles it uniformly.
         normalized = iso_timestamp.rstrip("Z") + ("+00:00" if iso_timestamp.endswith("Z") else "")
         dt_with_tz = datetime.fromisoformat(normalized)
         dt_local = dt_with_tz.astimezone(target_tz)
         return dt_local.strftime("%Y-%m-%d %H:%M:%S.") + f"{dt_local.microsecond // 1000:03d}"
     except ValueError:
-        # Fallback: strip T and timezone suffix without conversion
         return iso_timestamp.replace("T", " ").split("+")[0].rstrip("Z")
+
 
 # ─── State Management ───
 
@@ -105,10 +117,9 @@ def _save_collect_state(state: dict) -> None:
         json.dump(state, state_file, indent=2)
 
 
-# ─── Content Extraction ───
+# ─── Content Extraction (identical to collect_logs.py) ───
 
 def _extract_content_parts(content: Any) -> dict:
-    """Extract plain text, thinking text, and tool calls from a content field."""
     result = {"content_text": None, "thinking_text": None, "tool_calls": []}
 
     if isinstance(content, str):
@@ -124,7 +135,6 @@ def _extract_content_parts(content: Any) -> dict:
     for item in content:
         if not isinstance(item, dict):
             continue
-
         item_type = item.get("type")
         if item_type == "text" and isinstance(item.get("text"), str):
             text_parts.append(item["text"])
@@ -144,27 +154,13 @@ def _extract_content_parts(content: Any) -> dict:
 
 
 def _parse_message_fields(message_obj: dict, record_type: str) -> dict:
-    """Parse wide-table fields from the message JSON."""
     result = {
-        "role": None,
-        "model": None,
-        "api": None,
-        "provider": None,
-        "stop_reason": None,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cache_read_tokens": 0,
-        "cache_write_tokens": 0,
-        "total_tokens": 0,
-        "total_cost": 0,
-        "tool_name": None,
-        "tool_input": None,
-        "tool_use_id": None,
-        "is_error": 0,
-        "content_text": None,
-        "content_length": 0,
-        "thinking_text": None,
-        "sender_id": None,
+        "role": None, "model": None, "api": None, "provider": None,
+        "stop_reason": None, "input_tokens": 0, "output_tokens": 0,
+        "cache_read_tokens": 0, "cache_write_tokens": 0, "total_tokens": 0,
+        "total_cost": 0, "tool_name": None, "tool_input": None,
+        "tool_use_id": None, "is_error": 0, "content_text": None,
+        "content_length": 0, "thinking_text": None, "sender_id": None,
     }
 
     if not isinstance(message_obj, dict):
@@ -221,7 +217,6 @@ def _parse_message_fields(message_obj: dict, record_type: str) -> dict:
         if isinstance(message_obj.get("toolName"), str):
             result["tool_name"] = message_obj["toolName"]
         result["is_error"] = 1 if message_obj.get("isError") is True else 0
-        # toolResult.content can be a string or an array of {type, text} objects
         raw_content = message_obj.get("content")
         if not result["content_text"]:
             if isinstance(raw_content, str):
@@ -231,7 +226,8 @@ def _parse_message_fields(message_obj: dict, record_type: str) -> dict:
                 text_parts = [
                     item["text"]
                     for item in raw_content
-                    if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str) and item["text"]
+                    if isinstance(item, dict) and item.get("type") == "text"
+                    and isinstance(item.get("text"), str) and item["text"]
                 ]
                 if text_parts:
                     result["content_text"] = "\n".join(text_parts)
@@ -241,10 +237,6 @@ def _parse_message_fields(message_obj: dict, record_type: str) -> dict:
 
 
 def _extract_sender_id(content_text: Optional[str]) -> Optional[str]:
-    """
-    Extract sender_id from user message content metadata.
-    The sender_id is embedded in a markdown code block containing JSON with a "sender_id" field.
-    """
     if not content_text:
         return None
     match = re.search(r'"sender_id"\s*:\s*"([^"]+)"', content_text)
@@ -254,35 +246,21 @@ def _extract_sender_id(content_text: Optional[str]) -> Optional[str]:
 # ─── JSONL Session Parsing ───
 
 def _parse_jsonl_line(line: str, session_id: str, target_tz: ZoneInfo) -> Optional[dict]:
-    """
-    Parse a single JSONL line into a session record dict.
-
-    session_id is derived from the filename (e.g. c7db805e-....jsonl → c7db805e-...).
-    target_tz is the ADB timezone queried at the start of each collection run.
-    All line types are recorded; non-message lines will have empty message fields.
-    """
     trimmed = line.strip()
     if not trimmed:
         return None
-
     try:
         parsed = json.loads(trimmed)
     except json.JSONDecodeError:
         return None
 
     record_type = parsed.get("type")
-    # Use only the top-level "timestamp" (ISO 8601 string, e.g. "2026-03-08T05:13:46.463Z").
-    # The nested message.timestamp is a Unix millisecond integer and must NOT be used.
     timestamp = parsed.get("timestamp")
     if not record_type or not isinstance(timestamp, str) or not timestamp:
         return None
 
-    # Convert ISO 8601 UTC → MySQL DATETIME(3) in the ADB's current timezone.
     timestamp = _convert_iso_timestamp(timestamp, target_tz)
 
-    # For message lines, parse the nested message object into wide-table fields.
-    # For all other line types (model_change, thinking_level_change, custom, etc.),
-    # pass an empty dict so message fields are stored as NULL.
     if record_type == "message":
         message_obj = parsed.get("message") or {}
         if not isinstance(message_obj, dict):
@@ -291,13 +269,11 @@ def _parse_jsonl_line(line: str, session_id: str, target_tz: ZoneInfo) -> Option
         message_obj = {}
 
     wide_fields = _parse_message_fields(message_obj, record_type)
-
     sender_id = _extract_sender_id(wide_fields["content_text"]) if wide_fields["role"] == "user" else None
 
     return {
         "session_id": session_id,
         "type": record_type,
-        # JSON uses camelCase: "id" and "parentId"
         "id": parsed.get("id"),
         "parent_id": parsed.get("parentId"),
         "timestamp": timestamp,
@@ -307,7 +283,7 @@ def _parse_jsonl_line(line: str, session_id: str, target_tz: ZoneInfo) -> Option
     }
 
 
-def _should_filter(record: dict, config: AppConfig) -> bool:
+def _should_filter(record: dict, config: AppConfigCk) -> bool:
     filters = config.filters
     if filters.exclude_subsystems and record["type"] in filters.exclude_subsystems:
         return True
@@ -317,32 +293,28 @@ def _should_filter(record: dict, config: AppConfig) -> bool:
 
 
 def _find_session_files() -> list[str]:
-    """Scan the OpenClaw session directory and find all JSONL session files."""
     home_dir = os.path.expanduser("~")
     pattern = os.path.join(home_dir, ".openclaw", "agents", "*", "sessions", "*.jsonl")
     files = glob.glob(pattern)
     return sorted(files)
 
 
-async def _flush_session_batch(config: AppConfig, records: list[list[SqlValue]]) -> int:
-    inserted = execute_batch_insert(config.adb, config.adb.session_table, SESSION_COLUMNS, records)
-    print(f"[Collect:Session] Batch inserted {inserted} records")
+async def _flush_session_batch(config: AppConfigCk, records: list[list[SqlValue]]) -> int:
+    inserted = execute_batch_insert(config.ck, config.ck.session_table, SESSION_COLUMNS, records)
+    print(f"[Collect-CK:Session] Batch inserted {inserted} records")
     return inserted
 
 
-async def collect_sessions(config: AppConfig) -> int:
+async def collect_sessions(config: AppConfigCk) -> int:
     """Collect session data from JSONL files under the OpenClaw agents directory."""
-    print("[Collect:Session] Scanning OpenClaw session files...")
+    print("[Collect-CK:Session] Scanning OpenClaw session files...")
 
-    # Query ADB for its current timezone at the start of each run so that
-    # timestamp conversion always matches the database's actual timezone setting.
-    target_tz = _fetch_adb_timezone(config)
-
+    target_tz = _get_ck_timezone()
     session_files = _find_session_files()
-    print(f"[Collect:Session] Found {len(session_files)} session files")
+    print(f"[Collect-CK:Session] Found {len(session_files)} session files")
 
     if not session_files:
-        print("[Collect:Session] No session files found, skipping")
+        print("[Collect-CK:Session] No session files found, skipping")
         return 0
 
     state = _load_collect_state()
@@ -356,16 +328,13 @@ async def collect_sessions(config: AppConfig) -> int:
         if file_state and file_state.get("lastModified", 0) >= file_mtime_ms:
             continue
 
-        print(f"[Collect:Session] Processing: {os.path.basename(file_path)}")
+        print(f"[Collect-CK:Session] Processing: {os.path.basename(file_path)}")
 
         with open(file_path, "r", encoding="utf-8") as session_file:
             content = session_file.read()
 
         lines = content.split("\n")
-
-        # Derive session_id from the filename: e.g. "c7db805e-e413-4efb-97e9-5f583f5d3583.jsonl" → "c7db805e-..."
         session_id = os.path.splitext(os.path.basename(file_path))[0]
-
         start_line = file_state["lastLineOffset"] if file_state else 0
         records: list[list[SqlValue]] = []
 
@@ -378,6 +347,7 @@ async def collect_sessions(config: AppConfig) -> int:
                 continue
 
             records.append([
+                _next_row_id(),          # row_id (generated)
                 record["session_id"],
                 record["type"],
                 record.get("id"),
@@ -385,7 +355,7 @@ async def collect_sessions(config: AppConfig) -> int:
                 record["timestamp"],
                 record["hostname"],
                 record["sender_id"],
-                raw_line.strip(),  # complete_session: the raw JSON of this single line
+                raw_line.strip(),        # complete_session
                 record["role"],
                 record["model"],
                 record["api"],
@@ -419,14 +389,13 @@ async def collect_sessions(config: AppConfig) -> int:
         }
 
     _save_collect_state(state)
-    print(f"[Collect:Session] Inserted {total_inserted} session records in this run")
+    print(f"[Collect-CK:Session] Inserted {total_inserted} session records in this run")
     return total_inserted
 
 
 # ─── Log File Parsing ───
 
 def _find_log_files() -> list[str]:
-    """Scan the OpenClaw log directory and find all daily log files."""
     if not os.path.exists(LOG_DIRECTORY):
         return []
     entries = os.listdir(LOG_DIRECTORY)
@@ -469,10 +438,6 @@ def _extract_log_level(parsed: dict, meta: dict) -> str:
 
 
 def _extract_subsystem(parsed: dict, meta: dict) -> Optional[str]:
-    """
-    Extract subsystem from field "0" embedded JSON (e.g. '{"subsystem":"gateway/channels/dingtalk"}').
-    Falls back to top-level "subsystem" key or meta "name" if not found.
-    """
     field0 = parsed.get("0")
     if isinstance(field0, str) and field0.strip().startswith("{"):
         try:
@@ -506,15 +471,9 @@ def _extract_subsystem(parsed: dict, meta: dict) -> Optional[str]:
 
 
 def _parse_log_line(line: str, target_tz: ZoneInfo) -> Optional[dict]:
-    """
-    Parse a single log line from the daily log file.
-    target_tz is the ADB timezone queried at the start of each collection run,
-    used to convert the ISO 8601 timestamp to a MySQL DATETIME(3) string.
-    """
     trimmed = line.strip()
     if not trimmed:
         return None
-
     try:
         parsed = json.loads(trimmed)
     except json.JSONDecodeError:
@@ -528,10 +487,7 @@ def _parse_log_line(line: str, target_tz: ZoneInfo) -> Optional[dict]:
     if not raw_timestamp:
         return None
 
-    # Convert ISO 8601 timestamp (with or without timezone offset) to MySQL DATETIME(3)
-    # in the ADB's current timezone. Log timestamps look like "2026-03-11T10:54:24.111+08:00".
     timestamp = _convert_iso_timestamp(raw_timestamp, target_tz)
-
     level = _extract_log_level(parsed, meta)
     meta_parent_names = meta.get("parentNames")
 
@@ -547,7 +503,10 @@ def _parse_log_line(line: str, target_tz: ZoneInfo) -> Optional[dict]:
         "hostname": _as_str_or_none(parsed.get("hostname") or meta.get("hostname")) or socket.gethostname(),
         "meta_name": _as_str_or_none(meta.get("name")),
         "meta_parent_names": json.dumps(meta_parent_names) if meta_parent_names is not None else None,
-        "meta_date": _convert_iso_timestamp(meta["date"], target_tz) if isinstance(meta.get("date"), str) and meta["date"] else None,
+        "meta_date": (
+            _convert_iso_timestamp(meta["date"], target_tz)
+            if isinstance(meta.get("date"), str) and meta["date"] else None
+        ),
         "meta_log_level_id": meta.get("logLevelId") if isinstance(meta.get("logLevelId"), int) else None,
         "meta_log_level_name": _as_str_or_none(meta.get("logLevelName")),
         "meta_path": (
@@ -556,22 +515,19 @@ def _parse_log_line(line: str, target_tz: ZoneInfo) -> Optional[dict]:
     }
 
 
-async def collect_log_files(config: AppConfig) -> int:
+async def collect_log_files(config: AppConfigCk) -> int:
     """Collect log data from /tmp/openclaw/openclaw-YYYY-MM-DD.log files."""
-    print(f"[Collect:Log] Scanning log files in {LOG_DIRECTORY}...")
+    print(f"[Collect-CK:Log] Scanning log files in {LOG_DIRECTORY}...")
 
-    # Query ADB for its current timezone at the start of each run so that
-    # timestamp conversion always matches the database's actual timezone setting.
-    target_tz = _fetch_adb_timezone(config)
-
+    target_tz = _get_ck_timezone()
     log_files = _find_log_files()
-    print(f"[Collect:Log] Found {len(log_files)} log files")
+    print(f"[Collect-CK:Log] Found {len(log_files)} log files")
 
     if not log_files:
-        print("[Collect:Log] No log files found, skipping")
+        print("[Collect-CK:Log] No log files found, skipping")
         return 0
 
-    logs_table = config.adb.logs_table or "openclaw_logs"
+    logs_table = config.ck.logs_table or "openclaw_logs"
     state = _load_collect_state()
     total_inserted = 0
 
@@ -583,7 +539,7 @@ async def collect_log_files(config: AppConfig) -> int:
         if file_state and file_state.get("lastModified", 0) >= file_mtime_ms:
             continue
 
-        print(f"[Collect:Log] Processing: {os.path.basename(file_path)}")
+        print(f"[Collect-CK:Log] Processing: {os.path.basename(file_path)}")
 
         with open(file_path, "r", encoding="utf-8") as log_file:
             content = log_file.read()
@@ -599,6 +555,7 @@ async def collect_log_files(config: AppConfig) -> int:
                 continue
 
             records.append([
+                _next_row_id(),          # row_id (generated)
                 log_record["timestamp"],
                 log_record["level"],
                 log_record["subsystem"],
@@ -618,15 +575,15 @@ async def collect_log_files(config: AppConfig) -> int:
             ])
 
             if len(records) >= config.collection.batch_size:
-                inserted = execute_batch_insert(config.adb, logs_table, LOG_COLUMNS, records)
+                inserted = execute_batch_insert(config.ck, logs_table, LOG_COLUMNS, records)
                 total_inserted += inserted
                 records.clear()
-                print(f"[Collect:Log] Batch inserted {inserted} records")
+                print(f"[Collect-CK:Log] Batch inserted {inserted} records")
 
         if records:
-            inserted = execute_batch_insert(config.adb, logs_table, LOG_COLUMNS, records)
+            inserted = execute_batch_insert(config.ck, logs_table, LOG_COLUMNS, records)
             total_inserted += inserted
-            print(f"[Collect:Log] Batch inserted {inserted} records")
+            print(f"[Collect-CK:Log] Batch inserted {inserted} records")
 
         state[file_path] = {
             "lastLineOffset": len(lines),
@@ -634,11 +591,11 @@ async def collect_log_files(config: AppConfig) -> int:
         }
 
     _save_collect_state(state)
-    print(f"[Collect:Log] Inserted {total_inserted} log records in this run")
+    print(f"[Collect-CK:Log] Inserted {total_inserted} log records in this run")
     return total_inserted
 
 
-async def collect_logs(config: AppConfig) -> int:
+async def collect_logs(config: AppConfigCk) -> int:
     """Collect both session data and log data. Main entry point called by the scheduler."""
     total_inserted = 0
     total_inserted += await collect_sessions(config)
@@ -646,39 +603,48 @@ async def collect_logs(config: AppConfig) -> int:
     return total_inserted
 
 
-async def clean_expired_data(config: AppConfig) -> None:
-    """Clean up expired data from both tables."""
+async def clean_expired_data(config: AppConfigCk) -> None:
+    """
+    Clean up expired data from both tables using ClickHouse mutations.
+
+    ClickHouse does not support standard DELETE FROM.  ALTER TABLE ... DELETE
+    is used instead (an asynchronous mutation — the actual deletion happens
+    in the background; data becomes invisible to new queries quickly).
+    """
     retention_days = config.collection.retention_days
     if retention_days <= 0:
         return
 
+    cutoff_dt = datetime.now(_CK_TIMEZONE) - timedelta(days=retention_days)
+    cutoff_str = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
+
     session_sql = (
-        f"DELETE FROM `{config.adb.session_table}` "
-        f"WHERE timestamp < DATE_SUB(NOW(), INTERVAL %s DAY)"
+        f"ALTER TABLE `{config.ck.session_table}` "
+        f"DELETE WHERE timestamp < '{cutoff_str}'"
     )
-    print(f"[Cleanup] Cleaning session data older than {retention_days} days...")
-    execute_query(config.adb, session_sql, (retention_days,))
+    print(f"[Cleanup-CK] Cleaning session data older than {retention_days} days (before {cutoff_str})...")
+    execute_query(config.ck, session_sql)
 
-    logs_table = config.adb.logs_table or "openclaw_logs"
+    logs_table = config.ck.logs_table or "openclaw_logs"
     logs_sql = (
-        f"DELETE FROM `{logs_table}` "
-        f"WHERE timestamp < DATE_SUB(NOW(), INTERVAL %s DAY)"
+        f"ALTER TABLE `{logs_table}` "
+        f"DELETE WHERE timestamp < '{cutoff_str}'"
     )
-    print(f"[Cleanup] Cleaning log data older than {retention_days} days...")
-    execute_query(config.adb, logs_sql, (retention_days,))
+    print(f"[Cleanup-CK] Cleaning log data older than {retention_days} days...")
+    execute_query(config.ck, logs_sql)
 
-    print("[Cleanup] Expired data cleanup completed")
+    print("[Cleanup-CK] Expired data cleanup mutation submitted")
 
 
 # ─── Standalone entry point ───
 
 if __name__ == "__main__":
     import asyncio
-    from scripts.config import load_config
-    from scripts.db import close_connection_pool
+    from scripts.config_ck import load_config_ck
+    from scripts.db_ck import close_connection_pool
 
     async def main() -> None:
-        config = load_config()
+        config = load_config_ck()
         await collect_logs(config)
         await clean_expired_data(config)
         close_connection_pool()

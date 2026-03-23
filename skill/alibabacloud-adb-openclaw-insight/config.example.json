@@ -1,9 +1,19 @@
 {
+  "clickhouse": {
+    "host": "cc-xxxxxxxx.clickhouse.ads.aliyuncs.com",
+    "port": 8123,
+    "database": "openclaw_ck",
+    "username": "admin",
+    "password": "xxxxxxxxxx",
+    "secure": false,
+    "sessionTable": "openclaw_sessions",
+    "logsTable": "openclaw_logs"
+  },
   "adb": {
     "jdbcUrl": "jdbc:mysql://xxxxxxxxxxx.ads.aliyuncs.com:3306/openclaw_adb",
     "username": "aps",
     "password": "xxxxxxxxxx",
-    "host": "xxxxxxxxxxx.ads.aliyuncs.com",
+    "host": "amv-bp1b9y9xhvpzm9p01110303229o.ads.aliyuncs.com",
     "port": 3306,
     "database": "openclaw_adb",
     "sessionTable": "openclaw_sessions",
@@ -23,10 +33,10 @@
     "excludeSubsystems": ["verbose", "trace"]
   },
   "llm": {
-    "endpoint": "https://coding.dashscope.aliyuncs.com/apps/anthropic",
+    "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "apiKey": "sk-xxxxxxxxxx",
-    "model": "qwen3.5-plus",
-    "apiType": "anthropic",
+    "model": "qwen-plus",
+    "apiType": "openai",
     "maxConcurrency": 5,
     "temperature": 0.1,
     "maxTokens": 128000
