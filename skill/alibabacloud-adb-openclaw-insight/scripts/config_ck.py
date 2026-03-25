@@ -116,6 +116,7 @@ def _parse_config_ck(raw: dict) -> AppConfigCk:
             enable_l3=bool(ana_raw.get("enableL3", True)),
             analysis_window_days=int(ana_raw.get("analysisWindowDays", 7)),
             max_sessions_for_llm=int(ana_raw.get("maxSessionsForLlm", 500)),
+            generate_html_report=bool(ana_raw.get("generateHtmlReport", False)),
         )
 
     return AppConfigCk(ck=ck, collection=collection, filters=filters, llm=llm, analysis=analysis)

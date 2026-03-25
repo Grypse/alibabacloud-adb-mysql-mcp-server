@@ -58,6 +58,7 @@ class AnalysisConfig:
     enable_l3: bool = True
     analysis_window_days: int = 7
     max_sessions_for_llm: int = 500
+    generate_html_report: bool = False
 
 
 @dataclass

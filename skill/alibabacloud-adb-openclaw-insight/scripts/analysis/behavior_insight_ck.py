@@ -493,6 +493,67 @@ _SCORING_DIMENSIONS = [
 
 _DEFAULT_SCORES = {dim: 1 for dim in _SCORING_DIMENSIONS}
 
+_SCORE_USER_PROMPT_TEMPLATE = (
+    "Evaluate these user prompts on the 6 dimensions described above.\n\n"
+    "{numbered}\n\n"
+    "Return a JSON array with goal_clarity, context_provided, chain_of_thought, "
+    "few_shot_examples, iteration_signals, specificity for each prompt."
+)
+
+
+async def _score_prompts_per_user(
+    rows: list[dict],
+    llm_client: LlmClient,
+    label: str = "score",
+    concurrency: int = 5,
+    msg_truncate: int = 500,
+) -> list[dict]:
+    """Score prompts grouped by user with concurrent per-user LLM requests.
+
+    Groups rows by sender_id, sends one request per user (messages truncated to
+    msg_truncate chars each), runs `concurrency` users simultaneously.
+
+    Returns a list of score dicts in the same order as `rows`.
+    """
+    # Group rows by sender_id, keeping original index for result alignment
+    user_rows: dict[str, list[tuple[int, dict]]] = {}
+    for idx, row in enumerate(rows):
+        uid = row["sender_id"]
+        if uid not in user_rows:
+            user_rows[uid] = []
+        user_rows[uid].append((idx, row))
+
+    user_ids = list(user_rows.keys())
+    results: list[dict] = [dict(_DEFAULT_SCORES)] * len(rows)
+    sem = asyncio.Semaphore(concurrency)
+    completed = 0
+    total = len(user_ids)
+
+    async def score_user(uid: str) -> None:
+        nonlocal completed
+        indexed_rows = user_rows[uid]
+        msgs = [r["user_prompt"][:msg_truncate] for _, r in indexed_rows]
+        numbered = "\n\n---\n\n".join(f"[{i + 1}]\n{msg}" for i, msg in enumerate(msgs))
+        user_prompt = _SCORE_USER_PROMPT_TEMPLATE.format(numbered=numbered)
+
+        async with sem:
+            try:
+                raw = await llm_client.chat_json(_PROMPT_QUALITY_SYSTEM_PROMPT, user_prompt)
+                if not isinstance(raw, list):
+                    raw = [raw] * len(msgs)
+            except Exception as exc:
+                print(f"[{label}] User {uid} scoring failed: {exc}")
+                raw = []
+
+            completed += 1
+            print(f"[{label}] {completed}/{total} users scored (user={uid}, msgs={len(msgs)})")
+
+        for j, (orig_idx, _) in enumerate(indexed_rows):
+            results[orig_idx] = raw[j] if j < len(raw) else dict(_DEFAULT_SCORES)
+
+    await asyncio.gather(*[score_user(uid) for uid in user_ids])
+    return results
+
 
 async def score_prompt_quality(
     ck_config: CkConfig,
@@ -530,34 +591,27 @@ async def score_prompt_quality(
             return _empty_prompt_quality_result()
 
         messages = [row["user_prompt"] for row in rows]
+        num_users = len({row["sender_id"] for row in rows})
 
         total_chars = sum(len(msg) for msg in messages)
-        estimated_tokens = int(total_chars * 1.5)
-        max_single_batch_tokens = 128_000
+        estimated_tokens = int(total_chars * 2.5)
 
-        if estimated_tokens < max_single_batch_tokens:
-            batch_size = len(messages)
-            print(f"[L2-4] Estimated {estimated_tokens} tokens (< 128K), sending all in one batch")
+        if estimated_tokens < 128_000:
+            # Small dataset: single flat batch (all messages together)
+            print(f"[L2-4] {len(rows)} msgs / {num_users} users, ~{estimated_tokens} tokens (< 128K) → single batch")
+
+            def _build_flat_prompt(batch: list[str], start_index: int) -> str:
+                numbered = "\n\n---\n\n".join(f"[{start_index + i + 1}]\n{msg}" for i, msg in enumerate(batch))
+                return _SCORE_USER_PROMPT_TEMPLATE.format(numbered=numbered)
+
+            results = await llm_client.batch_classify(
+                messages, _PROMPT_QUALITY_SYSTEM_PROMPT, len(messages),
+                _build_flat_prompt, label="L2-4:prompt_quality",
+            )
         else:
-            batch_size = 10
-            print(f"[L2-4] Estimated {estimated_tokens} tokens (>= 128K), splitting into batches of {batch_size}")
-
-        def build_user_prompt(batch: list[str], start_index: int) -> str:
-            numbered = "\n\n---\n\n".join(
-                f"[{start_index + i + 1}]\n{msg}" for i, msg in enumerate(batch)
-            )
-            return (
-                f"Evaluate these user prompts on the 6 dimensions described above.\n\n"
-                f"{numbered}\n\n"
-                f"Return a JSON array with goal_clarity, context_provided, chain_of_thought, "
-                f"few_shot_examples, iteration_signals, specificity for each prompt."
-            )
-
-        print(f"[L2-4] Queried {len(rows)} sessions, sending to LLM for prompt quality scoring...")
-        results = await llm_client.batch_classify(
-            messages, _PROMPT_QUALITY_SYSTEM_PROMPT, batch_size,
-            build_user_prompt, label="L2-4:prompt_quality",
-        )
+            # Large dataset: per-user concurrent scoring (5 users at a time)
+            print(f"[L2-4] {len(rows)} msgs / {num_users} users, ~{estimated_tokens} tokens (>= 128K) → per-user concurrent (concurrency=5)")
+            results = await _score_prompts_per_user(rows, llm_client, label="L2-4", concurrency=5)
 
         user_prompt_scores: dict[str, list[dict]] = {}
         for i, row in enumerate(rows):
@@ -1431,34 +1485,27 @@ async def track_user_maturity(
             return {"users": []}
 
         messages = [row["user_prompt"] for row in rows]
+        num_users = len({row["sender_id"] for row in rows})
 
         total_chars = sum(len(msg) for msg in messages)
-        estimated_tokens = int(total_chars * 1.5)
-        max_single_batch_tokens = 128_000
+        estimated_tokens = int(total_chars * 2.5)
 
-        if estimated_tokens < max_single_batch_tokens:
-            batch_size = len(messages)
-            print(f"[L2-8] Estimated {estimated_tokens} tokens (< 128K), sending all in one batch")
+        if estimated_tokens < 128_000:
+            # Small dataset: single flat batch (all messages together)
+            print(f"[L2-8] {len(rows)} msgs / {num_users} users, ~{estimated_tokens} tokens (< 128K) → single batch")
+
+            def _build_flat_prompt_l28(batch: list[str], start_index: int) -> str:
+                numbered = "\n\n---\n\n".join(f"[{start_index + i + 1}]\n{msg}" for i, msg in enumerate(batch))
+                return _SCORE_USER_PROMPT_TEMPLATE.format(numbered=numbered)
+
+            results = await llm_client.batch_classify(
+                messages, _PROMPT_QUALITY_SYSTEM_PROMPT, len(messages),
+                _build_flat_prompt_l28, label="L2-8:maturity",
+            )
         else:
-            batch_size = 10
-            print(f"[L2-8] Estimated {estimated_tokens} tokens (>= 128K), splitting into batches of {batch_size}")
-
-        def build_user_prompt(batch: list[str], start_index: int) -> str:
-            numbered = "\n\n---\n\n".join(
-                f"[{start_index + i + 1}]\n{msg}" for i, msg in enumerate(batch)
-            )
-            return (
-                f"Evaluate these user prompts on the 6 dimensions described above.\n\n"
-                f"{numbered}\n\n"
-                f"Return a JSON array with goal_clarity, context_provided, chain_of_thought, "
-                f"few_shot_examples, iteration_signals, specificity for each prompt."
-            )
-
-        print(f"[L2-8] Scoring {len(messages)} user messages for maturity tracking...")
-        results = await llm_client.batch_classify(
-            messages, _PROMPT_QUALITY_SYSTEM_PROMPT, batch_size,
-            build_user_prompt, label="L2-8:maturity",
-        )
+            # Large dataset: per-user concurrent scoring (5 users at a time)
+            print(f"[L2-8] {len(rows)} msgs / {num_users} users, ~{estimated_tokens} tokens (>= 128K) → per-user concurrent (concurrency=5)")
+            results = await _score_prompts_per_user(rows, llm_client, label="L2-8", concurrency=5)
 
         user_daily_scores: dict[str, dict[str, list[float]]] = {}
 

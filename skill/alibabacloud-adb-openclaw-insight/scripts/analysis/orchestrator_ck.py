@@ -42,6 +42,7 @@ from scripts.analysis.organizational_insight_ck import (
     discover_skill_candidates,
     generate_narrative_report,
     generate_structured_report,
+    generate_html_report,
 )
 
 RESULTS_TABLE = "openclaw_analysis_results"
@@ -300,10 +301,13 @@ class AnalysisOrchestratorCk:
 
             # ── Final Report (L3-5) ──
             if llm_client and l1_results and l2_results:
-                await self._generate_structured_final_report(
+                report_text = await self._generate_structured_final_report(
                     run_id, analysis_range, llm_client,
                     l1_results, l2_results, l3_results or {},
                 )
+                # ── HTML Report (optional) ──
+                if analysis_config.generate_html_report and llm_client and report_text:
+                    await self._generate_html_report(report_text, llm_client)
 
         except Exception as error:
             print(f"[Orchestrator-CK] ❌ Analysis failed: {error}")
@@ -317,11 +321,14 @@ class AnalysisOrchestratorCk:
         elapsed_str = f"{minutes}m {seconds}s ({total_elapsed:.1f}s)" if minutes else f"{total_elapsed:.1f}s"
 
         final_report_path = Path("output") / "final_report.md"
+        html_report_path = Path("output") / "final_report.html"
 
         print("\n" + "=" * 60)
         print("🎉 Full Analysis Completed (ClickHouse)")
         print(f"   Run ID:      {run_id}")
         print(f"   Report:      {final_report_path}")
+        if analysis_config.generate_html_report and html_report_path.exists():
+            print(f"   HTML Report: {html_report_path}")
         print(f"   Total time:  {elapsed_str}")
         print("=" * 60)
 
@@ -609,6 +616,19 @@ class AnalysisOrchestratorCk:
             )
             return ""
 
+    async def _generate_html_report(self, markdown_content: str, llm_client: LlmClient) -> None:
+        """Generate an HTML version of the final report and save to output/final_report.html."""
+        print(f"\n{'─'*50}")
+        print("▶ Generating HTML Report...")
+        html_content = await generate_html_report(markdown_content, llm_client)
+        if html_content:
+            html_path = Path("output") / "final_report.html"
+            html_path.parent.mkdir(parents=True, exist_ok=True)
+            html_path.write_text(html_content, encoding="utf-8")
+            print(f"✅ HTML Report saved → {html_path}")
+        else:
+            print("⚠️ HTML Report generation produced no output, skipped.")
+
     async def _generate_final_report(
         self,
         run_id: str,
@@ -766,8 +786,12 @@ class AnalysisOrchestratorCk:
             if failures:
                 print(f"   失败明细 ({len(failures)} 条):")
                 for item in failures:
-                    print(f"     session={item['sessionId']} sender={item['senderId']} "
-                          f"start={item.get('startRowId','?')} end={item.get('endRowId','?')}")
+                    if item.get("type") == "unknown":
+                        note = item.get("note") or f"{item.get('count', '?')} 条无 sender_id 的失败任务"
+                        print(f"     [匿名用户] {note}")
+                    else:
+                        print(f"     session={item.get('sessionId','?')} sender={item.get('senderId','?')} "
+                              f"start={item.get('startRowId','?')} end={item.get('endRowId','?')}")
 
         elif case_name == "L2-6":
             top_retry = details.get("topRetrySessions", [])
