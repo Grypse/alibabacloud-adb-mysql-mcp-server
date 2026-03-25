@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from scripts.config_ck import AppConfigCk
-from scripts.db_ck import execute_batch_insert, execute_ddl, execute_query, close_connection_pool
+from scripts.db_ck import execute_batch_insert, execute_ddl, execute_query
 from scripts.llm_client import LlmClient
 from scripts.types import TimeRange, last_n_days_range
 from scripts.analysis.operational_insight_ck import (
@@ -38,7 +38,12 @@ from scripts.analysis.behavior_insight_ck import (
     analyze_thinking_depth,
     track_user_maturity,
 )
-from scripts.analysis.organizational_insight_ck import run_l3_analysis, generate_narrative_report
+from scripts.analysis.organizational_insight_ck import (
+    run_l3_independent_cases,
+    discover_skill_candidates,
+    generate_narrative_report,
+    generate_structured_report,
+)
 from scripts.analysis.insight_logic_docs import generate_insight_logic_doc
 
 RESULTS_TABLE = "openclaw_analysis_results"
@@ -207,6 +212,8 @@ class AnalysisOrchestratorCk:
         """Run all enabled analysis layers and return the run_id."""
         run_id = str(uuid.uuid4())
 
+        analysis_start_time = time.time()
+
         print("\n" + "=" * 60)
         print("🔍 Starting Full Analysis (ClickHouse)")
         print("=" * 60)
@@ -232,121 +239,61 @@ class AnalysisOrchestratorCk:
         l2_results: dict | None = None
 
         try:
-            # ── L1 ──
-            if analysis_config.enable_l1:
-                ck = self._config.ck
-                table = self._table_name
+            # ── Phase 1: L1 + L2 + L3-independent (L3-1/2/3) all in parallel ──
+            async def _l1_group() -> dict | None:
+                if not analysis_config.enable_l1:
+                    return None
+                return await self._run_l1_cases(run_id, analysis_range)
 
-                l1_case_results = {}
-                l1_case_results["tokenEfficiency"] = await self._run_and_save_case(
-                    run_id, "L1-1", "L1_OPERATIONAL", analysis_range,
-                    analyze_token_efficiency, (ck, table, analysis_range),
-                )
-                l1_case_results["sessionDepth"] = await self._run_and_save_case(
-                    run_id, "L1-2", "L1_OPERATIONAL", analysis_range,
-                    analyze_session_depth, (ck, table, analysis_range),
-                )
-                l1_case_results["toolChains"] = await self._run_and_save_case(
-                    run_id, "L1-3", "L1_OPERATIONAL", analysis_range,
-                    analyze_tool_chains, (ck, table, analysis_range),
-                )
-                l1_case_results["highCostSessions"] = await self._run_and_save_case(
-                    run_id, "L1-4", "L1_OPERATIONAL", analysis_range,
-                    analyze_high_cost_sessions, (ck, table, analysis_range),
-                )
-                l1_case_results["anomalies"] = await self._run_and_save_case(
-                    run_id, "L1-5", "L1_OPERATIONAL", analysis_range,
-                    analyze_anomalies, (ck, table, analysis_range),
-                )
-                l1_results = {k: v for k, v in l1_case_results.items() if v is not None}
+            async def _l2_group() -> dict | None:
+                if not analysis_config.enable_l2:
+                    return None
+                return await self._run_l2_cases(run_id, analysis_range, llm_client)
 
-            # ── L2 ──
-            if analysis_config.enable_l2:
-                max_items = analysis_config.max_sessions_for_llm
-                ck = self._config.ck
-                table = self._table_name
-
-                l2_case_results = {}
-
-                # L2-1: Intent Classification (LLM)
-                if llm_client:
-                    l2_case_results["intents"] = await self._run_and_save_case(
-                        run_id, "L2-1", "L2_BEHAVIOR", analysis_range,
-                        classify_intents, (ck, table, analysis_range, llm_client, max_items),
-                    )
-                else:
-                    print("[Orchestrator-CK] ⚠️ L2-1 skipped: requires LLM config")
-
-                # L2-2: Task Complexity (SQL)
-                l2_case_results["complexity"] = await self._run_and_save_case(
-                    run_id, "L2-2", "L2_BEHAVIOR", analysis_range,
-                    assess_task_complexity, (ck, table, analysis_range),
+            async def _l3_independent_group() -> dict | None:
+                if not analysis_config.enable_l3 or not llm_client:
+                    return None
+                return await run_l3_independent_cases(
+                    self._config.ck, self._table_name, analysis_range, llm_client,
                 )
 
-                # L2-3: Task Success Rate (SQL)
-                l2_case_results["successRate"] = await self._run_and_save_case(
-                    run_id, "L2-3", "L2_BEHAVIOR", analysis_range,
-                    estimate_task_success_rate, (ck, table, analysis_range),
-                )
+            print("[Orchestrator-CK] Phase 1: Running L1 + L2 + L3-independent (L3-1/2/3) in parallel...")
+            l1_results, l2_results, l3_independent = await asyncio.gather(
+                _l1_group(), _l2_group(), _l3_independent_group(),
+            )
+            print("[Orchestrator-CK] Phase 1 complete.")
 
-                # L2-4: Prompt Quality (LLM)
-                if llm_client:
-                    l2_case_results["promptQuality"] = await self._run_and_save_case(
-                        run_id, "L2-4", "L2_BEHAVIOR", analysis_range,
-                        score_prompt_quality, (ck, table, analysis_range, llm_client),
-                    )
-                else:
-                    print("[Orchestrator-CK] ⚠️ L2-4 skipped: requires LLM config")
-
-                # L2-5: Topic Clustering (LLM)
-                if llm_client:
-                    l2_case_results["topics"] = await self._run_and_save_case(
-                        run_id, "L2-5", "L2_BEHAVIOR", analysis_range,
-                        cluster_topics, (ck, table, analysis_range, llm_client),
-                    )
-                else:
-                    print("[Orchestrator-CK] ⚠️ L2-5 skipped: requires LLM config")
-
-                # L2-6: Retry Behavior (SQL)
-                l2_case_results["retryBehavior"] = await self._run_and_save_case(
-                    run_id, "L2-6", "L2_BEHAVIOR", analysis_range,
-                    detect_retry_behavior, (ck, table, analysis_range),
-                )
-
-                # L2-7: Thinking Depth (SQL)
-                l2_case_results["thinkingDepth"] = await self._run_and_save_case(
-                    run_id, "L2-7", "L2_BEHAVIOR", analysis_range,
-                    analyze_thinking_depth, (ck, table, analysis_range),
-                )
-
-                # L2-8: User Maturity (LLM)
-                if llm_client:
-                    l2_case_results["userMaturity"] = await self._run_and_save_case(
-                        run_id, "L2-8", "L2_BEHAVIOR", analysis_range,
-                        track_user_maturity, (ck, table, analysis_range, llm_client),
-                    )
-                else:
-                    print("[Orchestrator-CK] ⚠️ L2-8 skipped: requires LLM config")
-
-                l2_results = {k: v for k, v in l2_case_results.items() if v is not None}
-
-            # ── L3 ──
+            # ── Phase 2: L3-4 (depends on L1+L2) + merge ──
             l3_results: dict | None = None
             if analysis_config.enable_l3 and llm_client and l1_results and l2_results:
-                l3_results = await self._run_and_save_case(
-                    run_id, "L3", "L3_ORGANIZATIONAL", analysis_range,
-                    run_l3_analysis, (
-                        self._config.ck, self._table_name, analysis_range,
-                        llm_client, l1_results, l2_results,
-                    ),
+                print("[Orchestrator-CK] Phase 2: Running L3-4 (skill candidates)...")
+                skill_candidates = await discover_skill_candidates(
+                    l1_results.get("toolChains", {}),
+                    l2_results.get("topics", {}),
+                    l2_results.get("intents", {}),
+                    llm_client,
                 )
+                l3_results = {
+                    **(l3_independent or {}),
+                    "skillCandidates": skill_candidates,
+                }
+                # Persist the combined L3 result
+                self._save_case_result(
+                    run_id, "L3", "L3_ORGANIZATIONAL", analysis_range,
+                    status="success",
+                    elapsed=0.0,
+                    summary="L3 完成: techStack, repeatedQuestions, bestPractices, skillCandidates",
+                    details=l3_results,
+                )
+                print("[Orchestrator-CK] Phase 2 complete.")
             elif analysis_config.enable_l3:
-                print("[Orchestrator-CK] ⚠️ L3 Analysis skipped: requires LLM config and L1/L2 results")
+                print("[Orchestrator-CK] ⚠️ L3-4 skipped: requires LLM config and L1/L2 results")
+                l3_results = l3_independent or {}
 
             # ── Final Report (L3-5) ──
             final_report_text: str = ""
             if llm_client and l1_results and l2_results:
-                final_report_text = await self._generate_final_report(
+                final_report_text = await self._generate_structured_final_report(
                     run_id, analysis_range, llm_client,
                     l1_results, l2_results, l3_results or {},
                 )
@@ -355,16 +302,12 @@ class AnalysisOrchestratorCk:
             print(f"[Orchestrator-CK] ❌ Analysis failed: {error}")
             raise
 
-        print("\n" + "=" * 60)
-        print("🎉 Full Analysis Completed (ClickHouse)")
-        print(f"   Run ID: {run_id}")
-        print("=" * 60)
-
+        # Auto-generate per-run report
         self.generate_report(run_id)
 
         try:
             doc_lang = _detect_language(final_report_text)
-            doc_path = await generate_insight_logic_doc(
+            await generate_insight_logic_doc(
                 run_id=run_id,
                 range_=analysis_range,
                 stack="ClickHouse",
@@ -375,11 +318,80 @@ class AnalysisOrchestratorCk:
                 output_dir=Path("output") / run_id,
                 language=doc_lang,
             )
-            print(f"[Orchestrator-CK] Insight metrics logic document updated → {doc_path}")
         except Exception as error:
             print(f"[Orchestrator-CK] ⚠️ Failed to generate insight logic doc: {error}")
 
+        total_elapsed = time.time() - analysis_start_time
+        minutes, seconds = divmod(int(total_elapsed), 60)
+        elapsed_str = f"{minutes}m {seconds}s ({total_elapsed:.1f}s)" if minutes else f"{total_elapsed:.1f}s"
+
+        final_report_path = Path("output") / "final_report.md"
+
+        print("\n" + "=" * 60)
+        print("🎉 Full Analysis Completed (ClickHouse)")
+        print(f"   Run ID:      {run_id}")
+        print(f"   Report:      {final_report_path}")
+        print(f"   Total time:  {elapsed_str}")
+        print("=" * 60)
+
         return run_id
+
+    async def _run_l1_cases(self, run_id: str, analysis_range: TimeRange) -> dict:
+        """Run all L1 cases in parallel and return a combined results dict."""
+        ck = self._config.ck
+        table = self._table_name
+
+        keys = ["tokenEfficiency", "sessionDepth", "toolChains", "highCostSessions", "anomalies"]
+        fns  = [analyze_token_efficiency, analyze_session_depth, analyze_tool_chains,
+                analyze_high_cost_sessions, analyze_anomalies]
+
+        tasks = [
+            self._run_and_save_case(
+                run_id, f"L1-{i+1}", "L1_OPERATIONAL", analysis_range,
+                fn, (ck, table, analysis_range),
+            )
+            for i, fn in enumerate(fns)
+        ]
+        results = await asyncio.gather(*tasks)
+        return {k: v for k, v in zip(keys, results) if v is not None}
+
+    async def _run_l2_cases(
+        self,
+        run_id: str,
+        analysis_range: TimeRange,
+        llm_client: Optional[LlmClient],
+    ) -> dict:
+        """Run all L2 cases in parallel and return a combined results dict."""
+        ck = self._config.ck
+        table = self._table_name
+        max_items = (self._config.analysis.max_sessions_for_llm
+                     if self._config.analysis else 100)
+
+        task_specs: list[tuple[str, str, object, tuple]] = [
+            ("complexity",    "L2-2", assess_task_complexity,      (ck, table, analysis_range)),
+            ("successRate",   "L2-3", estimate_task_success_rate,  (ck, table, analysis_range)),
+            ("retryBehavior", "L2-6", detect_retry_behavior,       (ck, table, analysis_range)),
+            ("thinkingDepth", "L2-7", analyze_thinking_depth,      (ck, table, analysis_range)),
+        ]
+
+        if llm_client:
+            task_specs += [
+                ("intents",      "L2-1", classify_intents,    (ck, table, analysis_range, llm_client, max_items)),
+                ("promptQuality","L2-4", score_prompt_quality, (ck, table, analysis_range, llm_client)),
+                ("topics",       "L2-5", cluster_topics,       (ck, table, analysis_range, llm_client)),
+                ("userMaturity", "L2-8", track_user_maturity,  (ck, table, analysis_range, llm_client)),
+            ]
+        else:
+            for case in ["L2-1", "L2-4", "L2-5", "L2-8"]:
+                print(f"[Orchestrator-CK] ⚠️ {case} skipped: requires LLM config")
+
+        keys  = [s[0] for s in task_specs]
+        tasks = [
+            self._run_and_save_case(run_id, s[1], "L2_BEHAVIOR", analysis_range, s[2], s[3])
+            for s in task_specs
+        ]
+        results = await asyncio.gather(*tasks)
+        return {k: v for k, v in zip(keys, results) if v is not None}
 
     async def _run_and_save_case(
         self,
@@ -491,6 +503,60 @@ class AnalysisOrchestratorCk:
             self._results_table_ensured = True
         except Exception as error:
             print(f"[Orchestrator-CK] ⚠️ Failed to ensure results table: {error}")
+
+    async def _generate_structured_final_report(
+        self,
+        run_id: str,
+        range_: TimeRange,
+        llm_client: LlmClient,
+        l1_results: dict,
+        l2_results: dict,
+        l3_results: dict,
+    ) -> str:
+        """Generate the structured final report (L3-5-NEW) using the
+        总体结论 → 关键问题 → 优化建议 format, write to CK DB and final_report.md.
+
+        Returns the report text so the caller can detect its language.
+        """
+        print(f"\n{'─'*50}")
+        print("▶ Generating Structured Final Report (L3-5)...")
+
+        start = time.time()
+        try:
+            all_results = {
+                "l1": l1_results,
+                "l2": l2_results,
+                "l3": l3_results,
+            }
+            result = await generate_structured_report(all_results, range_, llm_client)
+            elapsed = time.time() - start
+
+            report_text = result.get("report", "")
+            summary = f"最终报告已生成，共 {len(report_text)} 字符"
+
+            self._save_case_result(
+                run_id, "L3-5", "FINAL_REPORT", range_,
+                status="success", elapsed=elapsed, summary=summary,
+                details={"report": report_text},
+            )
+
+            report_path = Path("output") / "final_report.md"
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(report_text, encoding="utf-8")
+
+            print(f"✅ Final Report generated in {elapsed:.1f}s → {report_path}")
+            return report_text
+
+        except Exception as exc:
+            elapsed = time.time() - start
+            error_msg = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+            print(f"❌ Final Report generation failed in {elapsed:.1f}s: {exc}")
+            self._save_case_result(
+                run_id, "L3-5", "FINAL_REPORT", range_,
+                status="failure", elapsed=elapsed, summary=f"执行失败: {exc}",
+                details={}, error_message=error_msg,
+            )
+            return ""
 
     async def _generate_final_report(
         self,

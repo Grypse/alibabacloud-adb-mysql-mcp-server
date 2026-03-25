@@ -163,6 +163,7 @@ async def classify_intents(
 
         distribution: dict[str, int] = {}
         by_user: dict[str, dict[str, int]] = {}
+        senders_by_category: dict[str, set] = {}
         items: list[dict] = []
 
         for i, row in enumerate(rows):
@@ -177,6 +178,11 @@ async def classify_intents(
                 by_user[sender_id] = {}
             by_user[sender_id][category] = by_user[sender_id].get(category, 0) + 1
 
+            # Senders per category (deduplicated)
+            if category not in senders_by_category:
+                senders_by_category[category] = set()
+            senders_by_category[category].add(sender_id)
+
             items.append({
                 "rowId": row["row_id"],
                 "sessionId": row["session_id"],
@@ -190,6 +196,7 @@ async def classify_intents(
         return {
             "distribution": distribution,
             "byUser": by_user,
+            "sendersByCategory": {cat: sorted(sids) for cat, sids in senders_by_category.items()},
             "items": items,
         }
 

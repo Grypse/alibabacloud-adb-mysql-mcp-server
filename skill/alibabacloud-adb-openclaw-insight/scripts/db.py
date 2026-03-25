@@ -38,8 +38,10 @@ def _create_connection(adb_config: AdbConfig):
 
 
 def close_connection_pool() -> None:
-    """No-op kept for backward compatibility with callers."""
-    print("[DB] Connection cleanup (no-op, using per-call connections)")
+    """Shut down the shared DB thread-pool executor so the process can exit cleanly."""
+    print("[DB] Shutting down DB executor pool...")
+    _db_executor.shutdown(wait=True)
+    print("[DB] DB executor pool shut down")
 
 
 def execute_query(adb_config: AdbConfig, sql: str, params: Optional[tuple | list] = None) -> list[dict]:

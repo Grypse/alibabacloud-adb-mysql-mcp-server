@@ -5,6 +5,7 @@ Focuses on organizational-level insights, knowledge gaps, best practices, and sk
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 from scripts.config_ck import CkConfig
@@ -699,7 +700,242 @@ Return a JSON object:
         return {"report": "Report generation failed due to LLM error. Please check LLM configuration."}
 
 
+# ─── L3-5-NEW: Structured Report (总体结论 → 关键问题 → 优化建议) ───
+
+async def generate_structured_report(
+    all_results: dict,
+    range_: TimeRange,
+    llm_client: LlmClient,
+) -> dict:
+    """Generate a structured final report organized as:
+    总体结论 → 关键问题 → 优化建议 (ClickHouse version).
+
+    This is the new generation of the L3-5 report. The old
+    ``generate_narrative_report`` is kept for reference but is no longer
+    called in the main analysis flow.
+    """
+    print("[L3-5-NEW] Generating structured report (总体结论 → 关键问题 → 优化建议)...")
+
+    try:
+        system_prompt = """You are a senior engineering intelligence analyst writing an executive insight report about AI agent assistant usage patterns.
+
+## Critical Context: Understanding the Data
+
+The data you are analyzing comes from **OpenClaw**, an enterprise AI agent assistant platform. Each "session" or "task chain" represents an **AI Agent autonomously executing tasks** on behalf of a user — NOT a human manually operating a computer.
+
+Key distinctions you MUST apply throughout the report:
+- **Tool calls** (exec, read, write, web_fetch, etc.) are executed by the **AI Agent**, not by the user directly.
+- When you see patterns like "exec->exec->exec", it means the **Agent ran a sequence of commands**, not that a user typed commands manually.
+- **Users interact with the Agent through natural language messages**. The Agent then autonomously decides which tools to call and in what sequence.
+- Therefore, phrases like "用户手动执行命令" or "用户正在手动操作" are INCORRECT. The correct framing is "Agent 自动执行了..." or "AI 助理调用了...".
+- When discussing Skill candidates, the value proposition is NOT "减少用户的手动操作" but rather "将 Agent 的重复工作流封装为标准化 Skill，提升一致性和可复用性".
+
+## Report Requirements
+
+This is NOT a weekly report. It is an analysis report for a specific time range. Do NOT use terms like "本周", "周报", "weekly". Instead, refer to the analysis period using the exact dates provided.
+
+## Language Detection Rules
+
+Determine the report language based on the dominant language found in the user messages within the analysis data:
+- If the majority of user messages are in **Chinese**, write the entire report in **Chinese (中文)**.
+- If the majority of user messages are in **English**, write the entire report in **English**.
+- If the messages are evenly mixed, default to **Chinese**.
+
+Apply this language choice consistently throughout the entire report — do NOT mix languages within the report.
+
+## Writing Principles
+
+- **Conclusion-first**: Every section starts with the key takeaway, then supports it with data.
+- **Evidence-bound**: Every claim must cite a specific metric or data point from the analysis.
+- **Actionable**: Problems must be paired with root causes; recommendations must be specific and prioritized.
+- **Cross-layer synthesis**: Draw connections across L1/L2/L3 metrics — avoid treating them as isolated silos.
+- Use Markdown formatting: headers, bold text, tables, and bullet lists for readability."""
+
+        l1 = all_results.get("l1", {})
+        l2 = all_results.get("l2", {})
+        l3 = all_results.get("l3", {})
+
+        data_sections: list[str] = []
+
+        def append_section(label: str, data: dict) -> None:
+            if data:
+                data_sections.append(f"【{label}】\n{json.dumps(data, ensure_ascii=False, default=str)}")
+
+        # L1: Operational Efficiency
+        append_section("L1-1 Token 消耗与成本效率", l1.get("tokenEfficiency", {}))
+        append_section("L1-2 任务链深度分布", l1.get("sessionDepth", {}))
+        append_section("L1-3 工具链模式", l1.get("toolChains", {}))
+        append_section("L1-4 高成本会话 Top20", l1.get("highCostSessions", {}))
+        append_section("L1-5 异常检测", l1.get("anomalies", {}))
+
+        # L2: User Behavior
+        append_section("L2-1 意图分类分布", l2.get("intents", {}))
+        append_section("L2-2 任务复杂度", l2.get("complexity", {}))
+        append_section("L2-3 任务成功率", l2.get("successRate", {}))
+        append_section("L2-4 Prompt 质量评分", l2.get("promptQuality", {}))
+        append_section("L2-5 话题聚类", l2.get("topics", {}))
+        append_section("L2-6 重试行为检测", l2.get("retryBehavior", {}))
+        append_section("L2-7 思考深度分布", l2.get("thinkingDepth", {}))
+        append_section("L2-8 用户成熟度趋势", l2.get("userMaturity", {}))
+
+        # L3: Organizational Cognition
+        append_section("L3-1 技术栈热力图", l3.get("techStack", {}))
+        append_section("L3-2 高频重复问题", l3.get("repeatedQuestions", {}))
+        append_section("L3-3 最佳实践", l3.get("bestPractices", {}))
+        append_section("L3-4 技能候选", l3.get("skillCandidates", {}))
+
+        all_data_text = "\n\n".join(data_sections) if data_sections else "暂无分析数据"
+
+        user_prompt = f"""Based on the following OpenClaw enterprise AI agent assistant usage analysis data, write a structured insight report for engineering leadership.
+
+Analysis period: {range_.start_date} to {range_.end_date}
+
+IMPORTANT — Language selection: Examine the user messages in the intent classification (L2-1) and topic clustering (L2-5) data to determine whether the majority are in Chinese or English. Write the ENTIRE report in that language. Do NOT mix languages.
+
+This is NOT a weekly report. Refer to the analysis period using the exact dates above.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Analysis data (three-layer insight engine):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{all_data_text}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The report MUST follow exactly this three-part structure. Every claim must be backed by specific data from the analysis above. Synthesize ACROSS layers — do not just describe each metric in isolation.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REPORT STRUCTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+## 一、总体结论
+
+A holistic synthesis of the analysis period. Do NOT list raw numbers — interpret what they mean together.
+
+### 1.1 整体运营健康度
+One paragraph conclusion on the overall health of AI agent usage. Synthesize: total task volume, success rate (L2-3), anomaly count (L1-5), and cost trend (L1-1). Assign an overall health rating: 🟢 良好 / 🟡 待改善 / 🔴 需关注, with a one-line rationale.
+
+### 1.2 核心使用场景
+What are users primarily using the AI agent for? Synthesize the top intent categories (L2-1), hottest topic tags (L2-5), and main technology focus areas (L3-1) into a coherent narrative. Include a compact summary table:
+
+| 使用场景 | 占比/频次 | 数据来源 |
+|---|---|---|
+
+### 1.3 用户行为画像
+Describe the typical user profile based on: prompt quality distribution (L2-4), task complexity (L2-2), maturity trend (L2-8), and retry rate (L2-6). Are users sophisticated or still learning? Is adoption growing?
+
+---
+
+## 二、关键问题
+
+Identify 3–6 concrete problems found in the data, ordered by severity (高 → 中 → 低). Each problem must:
+- Have a clear, specific title
+- Cite the exact metrics that evidence the problem
+- Explain the business impact
+
+Use this format for each problem:
+
+### 问题N：[问题标题]（严重程度：高 / 中 / 低）
+
+**现象**：[1–2 sentences describing what was observed]
+
+**数据依据**：
+- [Metric source, e.g., L2-3]: [specific number or finding]
+- [Metric source]: [specific number or finding]
+
+**业务影响**：[What goes wrong if this problem is not addressed]
+
+Potential problems to look for (use data to confirm, not all may exist):
+- High-cost anomaly sessions consuming disproportionate tokens (L1-4, L1-5)
+- Elevated retry rate indicating unclear prompts or agent confusion (L2-6)
+- Task failure clusters in specific intent categories (L2-3 + L2-1 cross-analysis)
+- Knowledge gaps evidenced by the same question asked by multiple users independently (L3-2)
+- Prompt quality polarization — a small group dragging down average quality (L2-4)
+- Marathon sessions (very deep task chains) that may indicate runaway agents (L1-2)
+- Repeated tool chain patterns that suggest unautomated repetitive work (L1-3, L3-4)
+
+---
+
+## 三、优化建议
+
+Provide 4–6 specific, actionable recommendations in priority order (高 → 中 → 低). Each recommendation must directly address a problem identified in Section 二, or an opportunity identified in the data.
+
+Use this format for each recommendation:
+
+### 建议N：[建议标题]（优先级：高 / 中 / 低）
+
+**建议内容**：[Concrete action to take — be specific, not vague]
+
+**数据依据**：[Which metrics or findings in Section 二 motivated this recommendation]
+
+**预期收益**：[What measurable improvement is expected]
+
+**参考指标**：[Which metrics to track to measure success]
+
+Recommendations should cover a mix of:
+- Cost optimization (e.g., targeting high-cost session patterns from L1-4)
+- Quality improvement (e.g., Prompt quality training based on L2-4 findings)
+- Knowledge management (e.g., FAQ or knowledge base from L3-2 repeated questions)
+- Automation/Skill packaging (e.g., converting top tool chain patterns from L3-4 into reusable Skills)
+- Best practice promotion (e.g., spreading patterns from L3-3 to lower-maturity users in L2-8)
+
+---
+
+Notes:
+- If a data section is missing or empty, silently skip related subsections — do not mention the absence.
+- All tables must use standard Markdown syntax.
+- The report should be readable by both technical leads and non-technical managers.
+- Do NOT add any section outside the three main sections above (no appendix, no data dump section).
+
+Return a JSON object:
+{{
+  "report": "complete Markdown-formatted report text"
+}}"""
+
+        result = await llm_client.chat_json(system_prompt, user_prompt)
+
+        # Normalize: LLM may return a list instead of a dict
+        if isinstance(result, list):
+            result = result[0] if result and isinstance(result[0], dict) else {"report": str(result)}
+        if not isinstance(result, dict) or "report" not in result:
+            result = {"report": str(result)}
+
+        print("[L3-5-NEW] Structured report generated successfully")
+        return result
+
+    except Exception as error:
+        print(f"[L3-5-NEW] Error generating structured report: {error}")
+        return {"report": "Report generation failed due to LLM error. Please check LLM configuration."}
+
+
 # ─── L3 Analysis Orchestration ───
+
+async def run_l3_independent_cases(
+    ck_config: CkConfig,
+    table_name: str,
+    range_: TimeRange,
+    llm_client: LlmClient,
+) -> dict:
+    """Run L3-1/2/3 in parallel — no L1/L2 dependency (ClickHouse version).
+
+    Returns a partial L3 results dict with keys:
+    ``techStack``, ``repeatedQuestions``, ``bestPractices``.
+    """
+    print("[L3] Starting L3 independent cases (L3-1/2/3) in parallel...")
+
+    tech_stack, repeated_questions, best_practices = await asyncio.gather(
+        build_tech_stack_heatmap(ck_config, table_name, range_, llm_client),
+        discover_repeated_questions(ck_config, table_name, range_, llm_client),
+        extract_best_practices(ck_config, table_name, range_, llm_client),
+    )
+
+    print("[L3] L3 independent cases (L3-1/2/3) completed")
+    return {
+        "techStack": tech_stack,
+        "repeatedQuestions": repeated_questions,
+        "bestPractices": best_practices,
+    }
+
 
 async def run_l3_analysis(
     ck_config: CkConfig,
@@ -709,16 +945,23 @@ async def run_l3_analysis(
     l1_results: dict,
     l2_results: dict,
 ) -> dict:
-    print("[L3] Starting L3 organizational cognition analysis (ClickHouse)...")
+    print("[L3] Starting L3 organizational cognition analysis (ClickHouse, parallel)...")
 
-    tech_stack = await build_tech_stack_heatmap(ck_config, table_name, range_, llm_client)
-    repeated_questions = await discover_repeated_questions(ck_config, table_name, range_, llm_client)
-    best_practices = await extract_best_practices(ck_config, table_name, range_, llm_client)
-    skill_candidates = await discover_skill_candidates(
-        l1_results.get("toolChains", {}),
-        l2_results.get("topics", {}),
-        l2_results.get("intents", {}),
-        llm_client,
+    (
+        tech_stack,
+        repeated_questions,
+        best_practices,
+        skill_candidates,
+    ) = await asyncio.gather(
+        build_tech_stack_heatmap(ck_config, table_name, range_, llm_client),
+        discover_repeated_questions(ck_config, table_name, range_, llm_client),
+        extract_best_practices(ck_config, table_name, range_, llm_client),
+        discover_skill_candidates(
+            l1_results.get("toolChains", {}),
+            l2_results.get("topics", {}),
+            l2_results.get("intents", {}),
+            llm_client,
+        ),
     )
 
     print("[L3] L3 analysis completed successfully (ClickHouse)")

@@ -156,5 +156,7 @@ def execute_batch_insert(
 
 
 def close_connection_pool() -> None:
-    """No-op kept for API compatibility with callers that call this at shutdown."""
-    print("[DB-CK] Connection cleanup (no-op, using per-call connections)")
+    """Shut down the shared DB thread-pool executor so the process can exit cleanly."""
+    print("[DB-CK] Shutting down DB executor pool...")
+    _db_executor.shutdown(wait=True)
+    print("[DB-CK] DB executor pool shut down")
