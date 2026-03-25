@@ -43,15 +43,9 @@ from scripts.analysis.organizational_insight_ck import (
     generate_narrative_report,
     generate_structured_report,
 )
-from scripts.analysis.insight_logic_docs import generate_insight_logic_doc
 
 RESULTS_TABLE = "openclaw_analysis_results"
 
-
-def _detect_language(text: str) -> str:
-    """Return 'zh' if text contains enough Chinese characters, else 'en'."""
-    chinese_chars = sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
-    return "zh" if chinese_chars > 50 else "en"
 
 # ClickHouse DDL for the analysis results table
 _CREATE_RESULTS_TABLE_SQL = f"""
@@ -305,9 +299,8 @@ class AnalysisOrchestratorCk:
                 l3_results = l3_independent or {}
 
             # ── Final Report (L3-5) ──
-            final_report_text: str = ""
             if llm_client and l1_results and l2_results:
-                final_report_text = await self._generate_structured_final_report(
+                await self._generate_structured_final_report(
                     run_id, analysis_range, llm_client,
                     l1_results, l2_results, l3_results or {},
                 )
@@ -318,22 +311,6 @@ class AnalysisOrchestratorCk:
 
         # Auto-generate per-run report
         self.generate_report(run_id)
-
-        try:
-            doc_lang = _detect_language(final_report_text)
-            await generate_insight_logic_doc(
-                run_id=run_id,
-                range_=analysis_range,
-                stack="ClickHouse",
-                l1_results=l1_results,
-                l2_results=l2_results,
-                l3_results=l3_results,
-                llm_client=llm_client,
-                output_dir=Path("output") / run_id,
-                language=doc_lang,
-            )
-        except Exception as error:
-            print(f"[Orchestrator-CK] ⚠️ Failed to generate insight logic doc: {error}")
 
         total_elapsed = time.time() - analysis_start_time
         minutes, seconds = divmod(int(total_elapsed), 60)
@@ -378,8 +355,6 @@ class AnalysisOrchestratorCk:
         """Run all L2 cases in parallel and return a combined results dict."""
         ck = self._config.ck
         table = self._table_name
-        max_items = (self._config.analysis.max_sessions_for_llm
-                     if self._config.analysis else 100)
 
         task_specs: list[tuple[str, str, object, tuple]] = [
             ("complexity",    "L2-2", assess_task_complexity,      (ck, table, analysis_range)),
@@ -492,7 +467,7 @@ class AnalysisOrchestratorCk:
             elapsed = time.time() - start
             print(f"[{case_name}] Analysis function returned in {elapsed:.1f}s")
 
-            summarizer = _SUMMARIZERS.get(case_name, lambda r: "完成")
+            summarizer = _SUMMARIZERS.get(case_name, lambda _: "完成")
             summary = summarizer(result)
             print(f"[{case_name}] Summary: {summary}")
 

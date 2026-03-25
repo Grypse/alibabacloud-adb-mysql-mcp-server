@@ -1224,7 +1224,7 @@ async def detect_retry_behavior(
 ) -> dict:
     """Detect retry behavior using window functions (ClickHouse version).
 
-    LAG() OVER (PARTITION BY ... ORDER BY ...) is supported in ClickHouse 21.1+,
+    lag() OVER (PARTITION BY ... ORDER BY ...) is supported in ClickHouse 21.1+,
     so the SQL logic is identical to the MySQL version.
     """
     print("[L2-6] Starting retry behavior detection...")
@@ -1236,8 +1236,8 @@ async def detect_retry_behavior(
             WITH consecutive_users AS (
                 SELECT
                     session_id, sender_id, content_text, timestamp,
-                    LAG(content_text) OVER (PARTITION BY session_id ORDER BY timestamp) AS prev_content_text,
-                    LAG(role) OVER (PARTITION BY session_id ORDER BY timestamp) AS prev_role
+                    lag(content_text) OVER (PARTITION BY session_id ORDER BY timestamp) AS prev_content_text,
+                    lag(role) OVER (PARTITION BY session_id ORDER BY timestamp) AS prev_role
                 FROM `{table_name}`
                 WHERE timestamp >= %s AND timestamp < %s AND role = 'user'
                   AND sender_id IS NOT NULL AND sender_id != ''
