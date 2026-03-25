@@ -937,6 +937,31 @@ async def run_l3_independent_cases(
     }
 
 
+async def run_l3_independent_cases_no_tech_stack(
+    ck_config: CkConfig,
+    table_name: str,
+    range_: TimeRange,
+    llm_client: LlmClient,
+) -> dict:
+    """Run L3-2/3 in parallel, skipping L3-1 (tech stack handled by combined analysis).
+
+    Returns a partial L3 results dict with keys:
+    ``repeatedQuestions``, ``bestPractices``.
+    """
+    print("[L3] Starting L3-2/3 (tech stack skipped — handled by combined analysis)...")
+
+    repeated_questions, best_practices = await asyncio.gather(
+        discover_repeated_questions(ck_config, table_name, range_, llm_client),
+        extract_best_practices(ck_config, table_name, range_, llm_client),
+    )
+
+    print("[L3] L3-2/3 completed")
+    return {
+        "repeatedQuestions": repeated_questions,
+        "bestPractices": best_practices,
+    }
+
+
 async def run_l3_analysis(
     ck_config: CkConfig,
     table_name: str,

@@ -391,11 +391,13 @@ async def estimate_task_success_rate(
         overall: dict[str, int] = {"success": 0, "partial": 0, "failure": 0}
         by_user: dict[str, dict[str, int]] = {}
         items = []
-        failures: list[dict] = []
+        known_failures: list[dict] = []   # failures/partials with a real sender_id
+        unknown_failure_count = 0          # failures/partials without sender_id
 
         for row in rows:
             outcome = row.get("outcome", "failure")
-            sender_id = row.get("sender_id") or "unknown"
+            raw_sender = (row.get("sender_id") or "").strip()
+            sender_id = raw_sender if raw_sender else "unknown"
             score = float(row.get("score") or 0)
 
             overall[outcome] = overall.get(outcome, 0) + 1
@@ -415,9 +417,23 @@ async def estimate_task_success_rate(
             items.append(item)
 
             if outcome in ("failure", "partial"):
-                failures.append(item)
+                if raw_sender:
+                    known_failures.append(item)
+                else:
+                    unknown_failure_count += 1
 
-        print(f"[L2-3] Estimated success rate for {len(rows)} task chains ({len(failures)} failures/partial)")
+        # Keep at most 5 representative known-user failures to reduce report payload
+        failures: list[dict] = known_failures[:5]
+        if unknown_failure_count > 0:
+            failures.append({
+                "type": "unknown",
+                "count": unknown_failure_count,
+                "note": f"任务类型未知（{unknown_failure_count} 条无 sender_id 的失败/部分失败任务）",
+            })
+
+        total_failures = len(known_failures) + unknown_failure_count
+        print(f"[L2-3] Estimated success rate for {len(rows)} task chains "
+              f"({total_failures} failures/partial: {len(known_failures)} known, {unknown_failure_count} unknown)")
         return {"overall": overall, "byUser": by_user, "items": items, "failures": failures}
 
     except Exception as error:
@@ -860,6 +876,343 @@ async def cluster_topics(
     except Exception as error:
         print(f"[L2-5] Topic clustering failed: {error}")
         return {"categoryDistribution": {}, "topTags": [], "byUser": {}}
+
+
+# ─── Combined: L2-1 + L2-5 + L3-1 (Per-User Aggregated) ───
+
+_COMBINED_PER_MSG_SYSTEM_PROMPT = """You are analyzing enterprise AI assistant user messages. For each message, simultaneously:
+1. Classify the user's primary intent
+2. Classify the conversation topic with 1-2 tags
+3. Identify all technologies mentioned or implied
+
+### Intent Categories (use language matching the message — Chinese if predominantly Chinese, English if predominantly English):
+代码开发/Code Development, 问题修复/Bug Fixing, 代码优化/Code Optimization, 测试验证/Testing & Validation, 架构设计/Architecture Design, 知识问答/Knowledge Q&A, 配置部署/Configuration & Deployment, 数据分析/Data Analysis, 信息检索/Information Retrieval, 内容生成/Content Generation, 任务管理/Task Management, 工具使用/Tool Usage, 闲聊互动/Casual Interaction, 安全测试/Security Testing, 多媒体处理/Multimedia Processing, 其他/Other
+
+### Topic Categories (same language rule):
+代码开发/Code Development, 问题调试/Debugging, 架构设计/Architecture & Design, 测试验证/Testing, 代码审查/Code Review, 配置部署/DevOps & Deployment, 数据处理/Data & Analytics, 文档写作/Documentation, 项目管理/Project Management, 学习研究/Learning & Research, 工具使用/Tooling, 生活日常/Daily Life, 情感社交/Social & Emotional, 教育学习/Education, 影视音乐/Movies & Music, 游戏电竞/Gaming, 体育运动/Sports, 阅读创作/Reading & Writing, 闲聊互动/Casual Chat, 安全测试/Security Testing, 其他/Miscellaneous
+
+Return a JSON array with one object per message:
+{"intent": "label", "confidence": 0.0-1.0, "topic": "label", "tags": ["tag1"], "technologies": ["React"]}"""
+
+_COMBINED_PER_USER_SYSTEM_PROMPT = """You are analyzing enterprise AI assistant users based on their conversation histories.
+For each user, analyze all their messages and return:
+- intent_counts: estimated distribution of intent types ({"category_label": count})
+- topic_counts: estimated distribution of topic types ({"category_label": count})
+- tags: 2-3 representative lowercase topic tags summarizing the user's main interests
+- technologies: all technology names mentioned or implied in their messages (canonical names)
+
+### Intent Categories (Chinese if predominantly Chinese, English otherwise):
+代码开发/Code Development, 问题修复/Bug Fixing, 代码优化/Code Optimization, 测试验证/Testing & Validation, 架构设计/Architecture Design, 知识问答/Knowledge Q&A, 配置部署/Configuration & Deployment, 数据分析/Data Analysis, 信息检索/Information Retrieval, 内容生成/Content Generation, 任务管理/Task Management, 工具使用/Tool Usage, 闲聊互动/Casual Interaction, 安全测试/Security Testing, 多媒体处理/Multimedia Processing, 其他/Other
+
+### Topic Categories (same language rule):
+代码开发/Code Development, 问题调试/Debugging, 架构设计/Architecture & Design, 测试验证/Testing, 代码审查/Code Review, 配置部署/DevOps & Deployment, 数据处理/Data & Analytics, 文档写作/Documentation, 项目管理/Project Management, 学习研究/Learning & Research, 工具使用/Tooling, 生活日常/Daily Life, 情感社交/Social & Emotional, 教育学习/Education, 影视音乐/Movies & Music, 游戏电竞/Gaming, 体育运动/Sports, 阅读创作/Reading & Writing, 闲聊互动/Casual Chat, 安全测试/Security Testing, 其他/Miscellaneous
+
+Return a JSON array with one object per user (same order as input):
+{"user_id": "string", "intent_counts": {"代码开发": 5}, "topic_counts": {"配置部署": 3}, "tags": ["docker"], "technologies": ["Docker"]}"""
+
+
+def _build_top_tags(tag_counts: dict[str, dict]) -> list[dict]:
+    """Build and deduplicate top tags using Jaccard similarity."""
+    merged_tags: dict[str, dict] = {}
+    processed: set[str] = set()
+
+    for tag, data in tag_counts.items():
+        if tag in processed:
+            continue
+        merged = {"count": data["count"], "users": set(data["users"]), "category": data["category"]}
+        processed.add(tag)
+        for other_tag, other_data in tag_counts.items():
+            if other_tag in processed:
+                continue
+            if _string_jaccard(tag, other_tag) > 0.8:
+                merged["count"] += other_data["count"]
+                merged["users"].update(other_data["users"])
+                processed.add(other_tag)
+        merged_tags[tag] = merged
+
+    return sorted(
+        [
+            {"tag": t, "category": d["category"], "count": d["count"], "uniqueUsers": len(d["users"])}
+            for t, d in merged_tags.items()
+        ],
+        key=lambda x: x["count"],
+        reverse=True,
+    )[:30]
+
+
+async def _combined_per_message(rows: list[dict], llm_client: LlmClient) -> dict:
+    """Small dataset path: one LLM batch returning intent+topic+tech per message."""
+    messages = [r["msg_text"] for r in rows]
+    print(f"[Combined:per-msg] {len(messages)} messages → single batch")
+
+    def build_user_prompt(batch: list[str], start_index: int) -> str:
+        numbered = "\n\n---\n\n".join(f"[{start_index + i + 1}]\n{msg}" for i, msg in enumerate(batch))
+        return (
+            f"Analyze these {len(batch)} user messages for intent, topic, and technologies.\n\n"
+            f"{numbered}\n\n"
+            f"Return a JSON array with one object per message: "
+            f"{{intent, confidence, topic, tags[], technologies[]}}"
+        )
+
+    results = await llm_client.batch_classify(
+        messages, _COMBINED_PER_MSG_SYSTEM_PROMPT, len(messages),
+        build_user_prompt, label="combined:per-msg",
+    )
+
+    intent_dist: dict[str, int] = {}
+    intent_by_user: dict[str, dict[str, int]] = {}
+    intent_senders_by_cat: dict[str, set] = {}
+    intent_items: list[dict] = []
+
+    topic_cat_dist: dict[str, int] = {}
+    topic_tag_counts: dict[str, dict] = {}
+    topic_by_user: dict[str, dict[str, int]] = {}
+
+    tech_users: dict[str, set[str]] = {}
+    tech_sessions: dict[str, set[str]] = {}
+
+    for i, row in enumerate(rows):
+        res = results[i] if i < len(results) else {}
+        sender_id = row["sender_id"]
+        session_id = row["session_id"]
+
+        intent_cat = res.get("intent", "其他")
+        confidence = float(res.get("confidence", 0))
+        intent_dist[intent_cat] = intent_dist.get(intent_cat, 0) + 1
+        if sender_id not in intent_by_user:
+            intent_by_user[sender_id] = {}
+        intent_by_user[sender_id][intent_cat] = intent_by_user[sender_id].get(intent_cat, 0) + 1
+        if intent_cat not in intent_senders_by_cat:
+            intent_senders_by_cat[intent_cat] = set()
+        intent_senders_by_cat[intent_cat].add(sender_id)
+        intent_items.append({
+            "rowId": row["row_id"], "sessionId": session_id, "senderId": sender_id,
+            "category": intent_cat, "confidence": confidence, "preview": row["msg_text"][:100],
+        })
+
+        topic_cat = res.get("topic", "其他")
+        tags = res.get("tags", [])
+        topic_cat_dist[topic_cat] = topic_cat_dist.get(topic_cat, 0) + 1
+        if sender_id not in topic_by_user:
+            topic_by_user[sender_id] = {}
+        topic_by_user[sender_id][topic_cat] = topic_by_user[sender_id].get(topic_cat, 0) + 1
+        for tag in tags:
+            norm = tag.lower().strip()
+            if not norm:
+                continue
+            if norm not in topic_tag_counts:
+                topic_tag_counts[norm] = {"count": 0, "users": set(), "category": topic_cat}
+            topic_tag_counts[norm]["count"] += 1
+            topic_tag_counts[norm]["users"].add(sender_id)
+
+        for tech in res.get("technologies", []):
+            if not isinstance(tech, str) or not tech.strip():
+                continue
+            t = tech.strip()
+            if t not in tech_sessions:
+                tech_sessions[t] = set()
+                tech_users[t] = set()
+            tech_sessions[t].add(session_id)
+            tech_users[t].add(sender_id)
+
+    print(f"[Combined:per-msg] intents={len(intent_dist)}, topics={len(topic_cat_dist)}, techs={len(tech_sessions)}")
+    return {
+        "intents": {
+            "distribution": intent_dist,
+            "byUser": intent_by_user,
+            "sendersByCategory": {c: sorted(s) for c, s in intent_senders_by_cat.items()},
+            "items": intent_items,
+        },
+        "topics": {
+            "categoryDistribution": topic_cat_dist,
+            "topTags": _build_top_tags(topic_tag_counts),
+            "byUser": topic_by_user,
+        },
+        "tech_stack": {
+            "technologies": sorted(
+                [{"tech": t, "sessionCount": len(s), "uniqueUsers": len(tech_users[t])}
+                 for t, s in tech_sessions.items()],
+                key=lambda x: x["sessionCount"], reverse=True,
+            )
+        },
+    }
+
+
+async def _combined_per_user(rows: list[dict], llm_client: LlmClient) -> dict:
+    """Large dataset path: group by user, one LLM request per user batch."""
+    # Group rows by sender_id
+    user_rows: dict[str, list[dict]] = {}
+    for row in rows:
+        uid = row["sender_id"]
+        if uid not in user_rows:
+            user_rows[uid] = []
+        user_rows[uid].append(row)
+
+    user_ids = list(user_rows.keys())
+    user_sessions_map: dict[str, set[str]] = {
+        uid: {r["session_id"] for r in u_rows} for uid, u_rows in user_rows.items()
+    }
+
+    # Build one context string per user (truncate each message to 500 chars)
+    user_context_items: list[str] = []
+    for uid in user_ids:
+        snippets = [f"[{j+1}] {r['msg_text'][:500]}" for j, r in enumerate(user_rows[uid])]
+        user_context_items.append(f"user_id: {uid}\n" + "\n".join(snippets))
+
+    total_chars = sum(len(s) for s in user_context_items)
+    estimated_tokens = int(total_chars * 2.5)
+    batch_size = len(user_context_items) if estimated_tokens < 128_000 else 10
+    print(f"[Combined:per-user] {len(user_ids)} users, ~{estimated_tokens} tokens, batch_size={batch_size}")
+
+    def build_user_prompt(batch: list[str], start_index: int) -> str:
+        combined = "\n\n===\n\n".join(batch)
+        return (
+            f"Analyze these {len(batch)} users' conversation histories.\n\n"
+            f"{combined}\n\n"
+            f"Return a JSON array with one object per user (same order as input): "
+            f"{{user_id, intent_counts, topic_counts, tags[], technologies[]}}"
+        )
+
+    results = await llm_client.batch_classify(
+        user_context_items, _COMBINED_PER_USER_SYSTEM_PROMPT, batch_size,
+        build_user_prompt, label="combined:per-user",
+    )
+
+    intent_dist: dict[str, int] = {}
+    intent_by_user: dict[str, dict[str, int]] = {}
+    intent_senders_by_cat: dict[str, set] = {}
+
+    topic_cat_dist: dict[str, int] = {}
+    topic_tag_counts: dict[str, dict] = {}
+    topic_by_user: dict[str, dict[str, int]] = {}
+
+    tech_users: dict[str, set[str]] = {}
+    tech_sessions: dict[str, set[str]] = {}
+
+    for i, uid in enumerate(user_ids):
+        res = results[i] if i < len(results) else {}
+        u_sessions = user_sessions_map[uid]
+
+        intent_counts = res.get("intent_counts") or {}
+        if not isinstance(intent_counts, dict):
+            intent_counts = {}
+        intent_by_user[uid] = intent_counts
+        for cat, cnt in intent_counts.items():
+            intent_dist[cat] = intent_dist.get(cat, 0) + int(cnt)
+            if cat not in intent_senders_by_cat:
+                intent_senders_by_cat[cat] = set()
+            intent_senders_by_cat[cat].add(uid)
+
+        topic_counts = res.get("topic_counts") or {}
+        if not isinstance(topic_counts, dict):
+            topic_counts = {}
+        topic_by_user[uid] = topic_counts
+        for cat, cnt in topic_counts.items():
+            topic_cat_dist[cat] = topic_cat_dist.get(cat, 0) + int(cnt)
+        dominant_cat = max(topic_counts, key=lambda c: topic_counts[c]) if topic_counts else "其他"
+        for tag in res.get("tags", []):
+            norm = tag.lower().strip()
+            if not norm:
+                continue
+            if norm not in topic_tag_counts:
+                topic_tag_counts[norm] = {"count": 0, "users": set(), "category": dominant_cat}
+            topic_tag_counts[norm]["count"] += 1
+            topic_tag_counts[norm]["users"].add(uid)
+
+        for tech in res.get("technologies", []):
+            if not isinstance(tech, str) or not tech.strip():
+                continue
+            t = tech.strip()
+            if t not in tech_sessions:
+                tech_sessions[t] = set()
+                tech_users[t] = set()
+            tech_sessions[t].update(u_sessions)
+            tech_users[t].add(uid)
+
+    print(f"[Combined:per-user] intents={len(intent_dist)}, topics={len(topic_cat_dist)}, techs={len(tech_sessions)}")
+    return {
+        "intents": {
+            "distribution": intent_dist,
+            "byUser": intent_by_user,
+            "sendersByCategory": {c: sorted(s) for c, s in intent_senders_by_cat.items()},
+            "items": [],  # no per-row items in per-user mode
+        },
+        "topics": {
+            "categoryDistribution": topic_cat_dist,
+            "topTags": _build_top_tags(topic_tag_counts),
+            "byUser": topic_by_user,
+        },
+        "tech_stack": {
+            "technologies": sorted(
+                [{"tech": t, "sessionCount": len(s), "uniqueUsers": len(tech_users[t])}
+                 for t, s in tech_sessions.items()],
+                key=lambda x: x["sessionCount"], reverse=True,
+            )
+        },
+    }
+
+
+async def classify_messages_combined(
+    ck_config: CkConfig,
+    table_name: str,
+    range_: TimeRange,
+    llm_client: LlmClient,
+    max_items: int = 500,
+) -> dict:
+    """Combined analysis for L2-1 (intents), L2-5 (topics), and L3-1 (tech stack).
+
+    Discards unknown users (null/empty sender_id).
+    - Small datasets (estimated < 128K tokens at 2.5 tokens/char): one batch, per-message analysis.
+    - Large datasets: group by user, truncate each message to 500 chars, one batch per user group.
+
+    Returns dict with keys 'intents', 'topics', 'tech_stack'.
+    """
+    _empty: dict = {
+        "intents": {"distribution": {}, "byUser": {}, "sendersByCategory": {}, "items": []},
+        "topics": {"categoryDistribution": {}, "topTags": [], "byUser": {}},
+        "tech_stack": {"technologies": []},
+    }
+    print("[Combined] Starting combined L2-1+L2-5+L3-1 analysis (per-user aggregation)...")
+
+    try:
+        start_time, end_time = time_range_to_sql_params(range_)
+        sql = f"""
+            SELECT row_id, session_id, sender_id, content_text
+            FROM `{table_name}`
+            WHERE role = 'user'
+              AND timestamp >= %s AND timestamp < %s
+              AND content_text IS NOT NULL AND content_text != ''
+              AND sender_id IS NOT NULL AND sender_id != ''
+            ORDER BY sender_id, session_id, timestamp
+            LIMIT %s
+        """
+        rows = await execute_query_async(ck_config, sql, (start_time, end_time, max_items))
+
+        if not rows:
+            print("[Combined] No valid user messages found")
+            return _empty
+
+        for row in rows:
+            row["msg_text"] = _extract_user_message(row.get("content_text") or "")
+        rows = [r for r in rows if r["msg_text"]]
+
+        if not rows:
+            print("[Combined] No valid messages after metadata extraction")
+            return _empty
+
+        total_chars = sum(len(r["msg_text"]) for r in rows)
+        estimated_tokens = int(total_chars * 2.5)
+        print(f"[Combined] {len(rows)} messages from {len({r['sender_id'] for r in rows})} users, "
+              f"~{estimated_tokens} estimated tokens")
+
+        if estimated_tokens < 128_000:
+            return await _combined_per_message(rows, llm_client)
+        else:
+            return await _combined_per_user(rows, llm_client)
+
+    except Exception as error:
+        print(f"[Combined] Analysis failed: {error}")
+        return _empty
 
 
 # ─── L2-6: Retry Behavior Detection ───
