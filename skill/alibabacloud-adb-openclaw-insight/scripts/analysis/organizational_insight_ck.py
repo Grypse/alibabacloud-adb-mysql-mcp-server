@@ -626,6 +626,10 @@ Report structure:
 ### 3.1 Intent Classification
 - Narrative interpreting what users are mainly doing
 - Table showing each intent category with count and percentage
+- **Non-work usage**: Identify any intent categories that are non-work-related (e.g., 闲聊互动, 生活日常, 情感社交, 教育学习, 影视音乐, 游戏电竞, 体育运动, 阅读创作, Casual Chat, Daily Life, Social & Emotional, Education, Movies & Music, Gaming, Sports, Reading & Writing). For each such category that has data, use the `sendersByCategory` field to list the specific sender IDs involved. Present as a table:
+
+| 非工作意图类别 | 涉及用户（sender_id） | 消息数 |
+|---|---|---|
 
 ### 3.2 Task Complexity
 - Narrative interpreting the complexity distribution
@@ -671,7 +675,16 @@ Report structure:
 - Table showing candidate Skills (name, description, trigger, estimated weekly usage)
 
 ## 5. Action Recommendations
-3-5 specific, actionable recommendations in priority order, each with rationale and expected benefit.
+
+Organize all recommendations into exactly two sub-sections:
+
+### 5.1 Cost Optimization
+Recommendations targeting token/cost reduction, waste elimination, or non-work usage control. Sources: L1-4, L1-5, L2-6, L2-1 non-work intents. If no cost issues exist, write "No significant cost issues found" and skip.
+
+### 5.2 Skill Building / Effect Optimization
+Recommendations targeting quality improvement, knowledge consolidation, or packaging reusable workflows. Sources: L3-2, L3-3, L3-4, L2-4, L2-8.
+
+Each individual recommendation should include: title, priority (High/Medium/Low), concrete action, data rationale, and expected benefit.
 
 Notes:
 - Every section must have BOTH narrative analysis AND data display — neither can be omitted
@@ -804,6 +817,9 @@ Analysis data (three-layer insight engine):
 
 The report MUST follow exactly this three-part structure. Every claim must be backed by specific data from the analysis above. Synthesize ACROSS layers — do not just describe each metric in isolation.
 
+⚠️ CRITICAL RULE — sender_id 必须明确标注：
+凡是底层数据中包含 `sender_id` 字段的地方（例如 `sendersByCategory`、`topUsers`、`bottomUsers`、`failures[].sender_id`、`retrySenders`、`highCostSessions[].sender_id` 等），报告中必须直接写出这些 sender_id，不得用"某用户"、"部分用户"、"some users"等模糊表述替代。明确到具体用户，是工程团队最重要的信息。
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 REPORT STRUCTURE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -813,7 +829,7 @@ REPORT STRUCTURE
 A holistic synthesis of the analysis period. Do NOT list raw numbers — interpret what they mean together.
 
 ### 1.1 整体运营健康度
-One paragraph conclusion on the overall health of AI agent usage. Synthesize: total task volume, success rate (L2-3), anomaly count (L1-5), and cost trend (L1-1). Assign an overall health rating: 🟢 良好 / 🟡 待改善 / 🔴 需关注, with a one-line rationale.
+One paragraph conclusion on the overall health of AI agent usage. Synthesize: total task volume, success rate (L2-3), anomaly count (L1-5), and cost trend (L1-1). Assign an overall health rating: 🟢 良好 / 🟡 待改善 / 🔴 需关注, with a one-line rationale. If any anomaly or failure records include sender_id, explicitly name those users.
 
 ### 1.2 核心使用场景
 What are users primarily using the AI agent for? Synthesize the top intent categories (L2-1), hottest topic tags (L2-5), and main technology focus areas (L3-1) into a coherent narrative. Include a compact summary table:
@@ -821,8 +837,17 @@ What are users primarily using the AI agent for? Synthesize the top intent categ
 | 使用场景 | 占比/频次 | 数据来源 |
 |---|---|---|
 
+如果 L2-1 的意图分类中存在非工作类意图（如 闲聊互动、生活日常、情感社交、教育学习、影视音乐、游戏电竞、体育运动、阅读创作，或其英文对应类别），则在本节末尾追加以下表格，从 `sendersByCategory` 字段中读取对应的 sender_id 列表：
+
+| 非工作意图类别 | 涉及用户（sender_id） | 消息数 |
+|---|---|---|
+
 ### 1.3 用户行为画像
 Describe the typical user profile based on: prompt quality distribution (L2-4), task complexity (L2-2), maturity trend (L2-8), and retry rate (L2-6). Are users sophisticated or still learning? Is adoption growing?
+
+For prompt quality (L2-4): explicitly name the top 3 highest-scoring and bottom 3 lowest-scoring sender_ids and their scores — do not use vague descriptions.
+For retry behavior (L2-6): if the data includes per-user retry counts or sender_ids with high retry rates, list them explicitly.
+For maturity trend (L2-8): if per-user maturity data is available, name the specific sender_ids showing growth or regression.
 
 ---
 
@@ -831,6 +856,7 @@ Describe the typical user profile based on: prompt quality distribution (L2-4), 
 Identify 3–6 concrete problems found in the data, ordered by severity (高 → 中 → 低). Each problem must:
 - Have a clear, specific title
 - Cite the exact metrics that evidence the problem
+- **Explicitly name the sender_ids involved** wherever the data provides them
 - Explain the business impact
 
 Use this format for each problem:
@@ -843,26 +869,40 @@ Use this format for each problem:
 - [Metric source, e.g., L2-3]: [specific number or finding]
 - [Metric source]: [specific number or finding]
 
+**涉及用户**：[直接列出数据中与该问题关联的所有 sender_id。若数据中确实没有 sender_id，写"数据中无 sender_id 信息"。]
+
 **业务影响**：[What goes wrong if this problem is not addressed]
 
 Potential problems to look for (use data to confirm, not all may exist):
-- High-cost anomaly sessions consuming disproportionate tokens (L1-4, L1-5)
-- Elevated retry rate indicating unclear prompts or agent confusion (L2-6)
-- Task failure clusters in specific intent categories (L2-3 + L2-1 cross-analysis)
-- Knowledge gaps evidenced by the same question asked by multiple users independently (L3-2)
-- Prompt quality polarization — a small group dragging down average quality (L2-4)
-- Marathon sessions (very deep task chains) that may indicate runaway agents (L1-2)
+- High-cost anomaly sessions consuming disproportionate tokens (L1-4, L1-5) — cite sender_ids from highCostSessions
+- Elevated retry rate indicating unclear prompts or agent confusion (L2-6) — cite sender_ids with high retry counts
+- Task failure clusters in specific intent categories (L2-3 + L2-1 cross-analysis) — cite sender_ids from failures[]
+- Knowledge gaps evidenced by the same question asked by multiple users independently (L3-2) — cite the user list per repeated question
+- Prompt quality polarization — cite the specific low-scoring sender_ids from L2-4 bottomUsers
+- Marathon sessions (very deep task chains) that may indicate runaway agents (L1-2) — cite sender_ids from deep sessions
 - Repeated tool chain patterns that suggest unautomated repetitive work (L1-3, L3-4)
 
 ---
 
 ## 三、优化建议
 
-Provide 4–6 specific, actionable recommendations in priority order (高 → 中 → 低). Each recommendation must directly address a problem identified in Section 二, or an opportunity identified in the data.
+Provide 4–6 specific, actionable recommendations. Each recommendation must directly address a problem identified in Section 二, or an opportunity identified in the data.
 
-Use this format for each recommendation:
+**Organize all recommendations into exactly two sub-sections, in this order:**
 
-### 建议N：[建议标题]（优先级：高 / 中 / 低）
+### 3.1 成本优化类
+
+List all recommendations aimed at reducing token consumption, API cost, or eliminating wasteful usage patterns. Typical sources: high-cost sessions (L1-4), anomalies (L1-5), retry behavior (L2-6), non-work usage identified in intent classification (L2-1). If no cost issues are found in the data, write "暂无明显成本问题" and skip.
+
+### 3.2 技能沉淀 / 效果优化类
+
+List all recommendations aimed at improving usage quality, knowledge consolidation, or packaging reusable workflows as Skills. Typical sources: repeated questions (L3-2), best practices (L3-3), skill candidates (L3-4), prompt quality gaps (L2-4), low-maturity users (L2-8).
+
+---
+
+Use this format for each individual recommendation within its sub-section:
+
+#### 建议：[建议标题]（优先级：高 / 中 / 低）
 
 **建议内容**：[Concrete action to take — be specific, not vague]
 
@@ -871,13 +911,6 @@ Use this format for each recommendation:
 **预期收益**：[What measurable improvement is expected]
 
 **参考指标**：[Which metrics to track to measure success]
-
-Recommendations should cover a mix of:
-- Cost optimization (e.g., targeting high-cost session patterns from L1-4)
-- Quality improvement (e.g., Prompt quality training based on L2-4 findings)
-- Knowledge management (e.g., FAQ or knowledge base from L3-2 repeated questions)
-- Automation/Skill packaging (e.g., converting top tool chain patterns from L3-4 into reusable Skills)
-- Best practice promotion (e.g., spreading patterns from L3-3 to lower-maturity users in L2-8)
 
 ---
 

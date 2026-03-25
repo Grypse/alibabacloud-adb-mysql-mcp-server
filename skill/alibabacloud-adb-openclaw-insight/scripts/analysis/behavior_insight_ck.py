@@ -500,6 +500,39 @@ _SCORE_USER_PROMPT_TEMPLATE = (
     "few_shot_examples, iteration_signals, specificity for each prompt."
 )
 
+_MAX_BATCH_TOKENS = 128_000
+_TOKEN_CHARS_RATIO = 2.5
+
+
+def _make_token_bounded_batches(
+    user_ids: list[str],
+    user_tokens: dict[str, int],
+    max_tokens: int = _MAX_BATCH_TOKENS,
+) -> list[list[str]]:
+    """Greedily pack users into batches that each stay under max_tokens.
+
+    Each user that alone exceeds max_tokens gets its own single-user batch.
+    Returns a list of batches (each batch = list of user_ids).
+    """
+    batches: list[list[str]] = []
+    current_batch: list[str] = []
+    current_tokens = 0
+
+    for uid in user_ids:
+        t = user_tokens[uid]
+        if current_batch and current_tokens + t > max_tokens:
+            batches.append(current_batch)
+            current_batch = [uid]
+            current_tokens = t
+        else:
+            current_batch.append(uid)
+            current_tokens += t
+
+    if current_batch:
+        batches.append(current_batch)
+
+    return batches
+
 
 async def _score_prompts_per_user(
     rows: list[dict],
@@ -508,10 +541,11 @@ async def _score_prompts_per_user(
     concurrency: int = 5,
     msg_truncate: int = 500,
 ) -> list[dict]:
-    """Score prompts grouped by user with concurrent per-user LLM requests.
+    """Score prompts grouped by user, batching multiple users per LLM request.
 
-    Groups rows by sender_id, sends one request per user (messages truncated to
-    msg_truncate chars each), runs `concurrency` users simultaneously.
+    Groups rows by sender_id, builds context strings per user, then packs as
+    many users as possible into each request (up to 128K estimated tokens).
+    Runs `concurrency` batches concurrently.
 
     Returns a list of score dicts in the same order as `rows`.
     """
@@ -525,33 +559,71 @@ async def _score_prompts_per_user(
 
     user_ids = list(user_rows.keys())
     results: list[dict] = [dict(_DEFAULT_SCORES)] * len(rows)
-    sem = asyncio.Semaphore(concurrency)
-    completed = 0
-    total = len(user_ids)
 
-    async def score_user(uid: str) -> None:
-        nonlocal completed
+    # Build per-user context strings + estimate tokens
+    user_context: dict[str, str] = {}
+    user_tokens: dict[str, int] = {}
+    for uid in user_ids:
         indexed_rows = user_rows[uid]
         msgs = [r["user_prompt"][:msg_truncate] for _, r in indexed_rows]
-        numbered = "\n\n---\n\n".join(f"[{i + 1}]\n{msg}" for i, msg in enumerate(msgs))
+        ctx = "\n\n---\n\n".join(f"[{i + 1}]\n{msg}" for i, msg in enumerate(msgs))
+        user_context[uid] = ctx
+        user_tokens[uid] = int(len(ctx) * _TOKEN_CHARS_RATIO)
+
+    batches = _make_token_bounded_batches(user_ids, user_tokens)
+    total_batches = len(batches)
+    total_tokens = sum(user_tokens.values())
+    print(
+        f"[{label}] {len(user_ids)} users, ~{total_tokens} tokens → "
+        f"{total_batches} batches (token-bounded, concurrency={concurrency})"
+    )
+
+    sem = asyncio.Semaphore(concurrency)
+    completed = 0
+
+    async def score_batch(batch_uids: list[str], batch_idx: int) -> None:
+        nonlocal completed
+        # Build a combined numbered prompt across all users in this batch
+        # Each user's messages continue the global numbering
+        all_indexed_rows: list[tuple[int, dict]] = []  # (orig_idx, row)
+        numbered_parts: list[str] = []
+        global_num = 1
+        user_msg_counts: list[tuple[str, int]] = []  # (uid, msg_count)
+
+        for uid in batch_uids:
+            indexed_rows = user_rows[uid]
+            msg_count = len(indexed_rows)
+            user_msg_counts.append((uid, msg_count))
+            all_indexed_rows.extend(indexed_rows)
+            # Re-number messages with global index
+            msgs = [r["user_prompt"][:msg_truncate] for _, r in indexed_rows]
+            for msg in msgs:
+                numbered_parts.append(f"[{global_num}]\n{msg}")
+                global_num += 1
+
+        total_msgs = len(all_indexed_rows)
+        numbered = "\n\n---\n\n".join(numbered_parts)
         user_prompt = _SCORE_USER_PROMPT_TEMPLATE.format(numbered=numbered)
 
         async with sem:
             try:
                 raw = await llm_client.chat_json(_PROMPT_QUALITY_SYSTEM_PROMPT, user_prompt)
                 if not isinstance(raw, list):
-                    raw = [raw] * len(msgs)
+                    raw = [raw] * total_msgs
             except Exception as exc:
-                print(f"[{label}] User {uid} scoring failed: {exc}")
+                batch_uids_str = ",".join(batch_uids)
+                print(f"[{label}] Batch {batch_idx + 1} scoring failed ({batch_uids_str}): {exc}")
                 raw = []
 
             completed += 1
-            print(f"[{label}] {completed}/{total} users scored (user={uid}, msgs={len(msgs)})")
+            uids_str = ",".join(batch_uids)
+            print(f"[{label}] Batch {completed}/{total_batches} done (users={uids_str}, msgs={total_msgs})")
 
-        for j, (orig_idx, _) in enumerate(indexed_rows):
+        # Map flat raw scores back to original row indices
+        for j, (orig_idx, _) in enumerate(all_indexed_rows):
             results[orig_idx] = raw[j] if j < len(raw) else dict(_DEFAULT_SCORES)
 
-    await asyncio.gather(*[score_user(uid) for uid in user_ids])
+    await asyncio.gather(*[score_batch(batch, i) for i, batch in enumerate(batches)])
     return results
 
 
@@ -1093,7 +1165,11 @@ async def _combined_per_message(rows: list[dict], llm_client: LlmClient) -> dict
 
 
 async def _combined_per_user(rows: list[dict], llm_client: LlmClient) -> dict:
-    """Large dataset path: group by user, one LLM request per user batch."""
+    """Large dataset path: group by user, batching multiple users per LLM request.
+
+    Packs as many users as possible into each request (up to 128K estimated tokens),
+    then processes all batches concurrently (concurrency=5).
+    """
     # Group rows by sender_id
     user_rows: dict[str, list[dict]] = {}
     for row in rows:
@@ -1108,29 +1184,56 @@ async def _combined_per_user(rows: list[dict], llm_client: LlmClient) -> dict:
     }
 
     # Build one context string per user (truncate each message to 500 chars)
-    user_context_items: list[str] = []
+    user_context: dict[str, str] = {}
+    user_tokens: dict[str, int] = {}
     for uid in user_ids:
         snippets = [f"[{j+1}] {r['msg_text'][:500]}" for j, r in enumerate(user_rows[uid])]
-        user_context_items.append(f"user_id: {uid}\n" + "\n".join(snippets))
+        ctx = f"user_id: {uid}\n" + "\n".join(snippets)
+        user_context[uid] = ctx
+        user_tokens[uid] = int(len(ctx) * _TOKEN_CHARS_RATIO)
 
-    total_chars = sum(len(s) for s in user_context_items)
-    estimated_tokens = int(total_chars * 2.5)
-    batch_size = len(user_context_items) if estimated_tokens < 128_000 else 10
-    print(f"[Combined:per-user] {len(user_ids)} users, ~{estimated_tokens} tokens, batch_size={batch_size}")
+    total_tokens = sum(user_tokens.values())
+    batches = _make_token_bounded_batches(user_ids, user_tokens)
+    total_batches = len(batches)
+    print(
+        f"[Combined:per-user] {len(user_ids)} users, ~{total_tokens} tokens → "
+        f"{total_batches} batches (token-bounded, concurrency=5)"
+    )
 
-    def build_user_prompt(batch: list[str], start_index: int) -> str:
-        combined = "\n\n===\n\n".join(batch)
-        return (
-            f"Analyze these {len(batch)} users' conversation histories.\n\n"
+    # results[i] will hold the LLM result for user_ids[i]
+    results: list[dict] = [{}] * len(user_ids)
+    uid_to_idx = {uid: i for i, uid in enumerate(user_ids)}
+    sem = asyncio.Semaphore(5)
+    completed = 0
+
+    async def process_batch(batch_uids: list[str], batch_num: int) -> None:
+        nonlocal completed
+        combined = "\n\n===\n\n".join(user_context[uid] for uid in batch_uids)
+        user_prompt = (
+            f"Analyze these {len(batch_uids)} users' conversation histories.\n\n"
             f"{combined}\n\n"
             f"Return a JSON array with one object per user (same order as input): "
             f"{{user_id, intent_counts, topic_counts, tags[], technologies[]}}"
         )
+        async with sem:
+            try:
+                raw = await llm_client.chat_json(_COMBINED_PER_USER_SYSTEM_PROMPT, user_prompt)
+                if not isinstance(raw, list):
+                    raw = [{}] * len(batch_uids)
+            except Exception as exc:
+                print(f"[Combined:per-user] Batch {batch_num} failed: {exc}")
+                raw = []
 
-    results = await llm_client.batch_classify(
-        user_context_items, _COMBINED_PER_USER_SYSTEM_PROMPT, batch_size,
-        build_user_prompt, label="combined:per-user",
-    )
+            completed += 1
+            print(
+                f"[Combined:per-user] Batch {completed}/{total_batches} done "
+                f"(users={len(batch_uids)}, ids={','.join(batch_uids)})"
+            )
+
+        for j, uid in enumerate(batch_uids):
+            results[uid_to_idx[uid]] = raw[j] if j < len(raw) else {}
+
+    await asyncio.gather(*[process_batch(batch, i + 1) for i, batch in enumerate(batches)])
 
     intent_dist: dict[str, int] = {}
     intent_by_user: dict[str, dict[str, int]] = {}
