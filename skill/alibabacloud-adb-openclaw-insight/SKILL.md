@@ -58,6 +58,8 @@ uv run python -m scripts.main
 
 ### CLI Commands
 
+> **统一入口**：所有命令均通过 `python -m scripts.main <command>` 调用。
+
 #### Collect — One-shot data collection
 
 ```bash
@@ -67,13 +69,11 @@ uv run python -m scripts.main collect
 #### Analyze — Run full insight analysis
 
 ```bash
+# 使用配置文件中的默认时间窗口
 uv run python -m scripts.main analyze
-```
 
-Custom time range:
-
-```bash
-uv run python -m scripts.analyze_usage --from "2026-03-01 00:00:00" --to "2026-03-10 23:59:59"
+# 自定义时间范围
+uv run python -m scripts.main analyze --from "2026-03-01 00:00:00" --to "2026-03-10 23:59:59"
 ```
 
 #### Final Report — Print the latest report
@@ -81,6 +81,57 @@ uv run python -m scripts.analyze_usage --from "2026-03-01 00:00:00" --to "2026-0
 ```bash
 uv run python -m scripts.main final-report
 ```
+
+#### Report — View a previous analysis run
+
+```bash
+uv run python -m scripts.main report <run_id>
+uv run python -m scripts.main report --run-id <run_id>
+```
+
+#### Drilldown — Deep-dive into report metrics
+
+报告生成后，可以对指标进行下钻查询，获取更详细的分析数据。
+
+##### 用户任务下钻
+
+查询指定用户在时间范围内的任务数量、复杂度分布和详细任务链信息：
+
+```bash
+uv run python -m scripts.main drilldown user-tasks --user 363779 --from "2026-03-01" --to "2026-03-10"
+```
+
+输出内容包括：
+- 任务链总数和复杂度分布（低/中/高/极高）
+- 平均复杂度评分
+- 总 Token 消耗和成本
+- Top 50 任务链详情（按复杂度排序）
+
+##### 非工作任务下钻
+
+查找被分类为"闲聊互动"或"安全测试"等非工作意图的任务，展示完整任务链、Token 消耗和用户原始问题内容，便于人工审核：
+
+```bash
+# 使用默认时间范围
+uv run python -m scripts.main drilldown non-work-tasks
+
+# 指定时间范围
+uv run python -m scripts.main drilldown non-work-tasks --from "2026-03-01" --to "2026-03-10"
+
+# 指定特定分析运行 ID
+uv run python -m scripts.main drilldown non-work-tasks --run-id <uuid>
+```
+
+输出内容包括：
+- 非工作任务总数
+- 每个任务的分类、用户 ID、置信度
+- 用户原始问题/指令的**完整内容**
+- 完整任务链消息列表（含每条消息的角色、Token、时间戳）
+- 总 Token 消耗和成本
+
+> **前提条件**：非工作任务下钻依赖 L2-1 意图分类结果，需先运行 `analyze` 命令完成分析。
+
+报告会自动保存到 `output/drilldown_user_tasks.md` 或 `output/drilldown_non_work_tasks.md`。
 
 ---
 
@@ -126,6 +177,8 @@ uv run python -m scripts.main_ck
 
 ### CLI Commands
 
+> **统一入口**：所有 ClickHouse 版命令均通过 `python -m scripts.main_ck <command>` 调用。
+
 #### Collect — 单次数据采集
 
 扫描新增 JSONL 会话文件和当日日志，批量写入 ClickHouse，保存断点续传检查点后退出。
@@ -139,20 +192,11 @@ uv run python -m scripts.main_ck collect
 按配置的时间窗口执行全量三层分析流水线（L1 运营效率 → L2 用户行为 → L3 组织认知 → 最终报告）。
 
 ```bash
+# 使用配置文件中的默认时间窗口
 uv run python -m scripts.main_ck analyze
-```
 
-自定义时间范围：
-
-```bash
-# 支持 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS 格式
-uv run python -m scripts.analyze_usage_ck --from "2026-03-01 00:00:00" --to "2026-03-10 23:59:59"
-```
-
-查询历史运行结果（--report 模式）：
-
-```bash
-uv run python -m scripts.analyze_usage_ck --report <run_id>
+# 自定义时间范围（支持 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS 格式）
+uv run python -m scripts.main_ck analyze --from "2026-03-01 00:00:00" --to "2026-03-10 23:59:59"
 ```
 
 #### Final Report — 打印最新分析报告
@@ -161,6 +205,13 @@ uv run python -m scripts.analyze_usage_ck --report <run_id>
 
 ```bash
 uv run python -m scripts.main_ck final-report
+```
+
+#### Report — 查看历史分析运行
+
+```bash
+uv run python -m scripts.main_ck report <run_id>
+uv run python -m scripts.main_ck report --run-id <run_id>
 ```
 
 ### 定时采集（OpenClaw Cron）
@@ -250,7 +301,7 @@ ClickHouse 版建表 DDL 位于 `sql/` 目录：
 | 时间戳类型 | DATETIME(3) | DateTime64(3, 'Asia/Shanghai') |
 | 删除方式 | DELETE FROM | ALTER TABLE … DELETE WHERE（异步 mutation） |
 | 入口脚本 | `scripts/main.py` | `scripts/main_ck.py` |
-| 分析入口 | `scripts/analyze_usage.py` | `scripts/analyze_usage_ck.py` |
+| 分析入口 | `scripts/main.py analyze` | `scripts/main_ck.py analyze` |
 | 初始化 | `scripts/init_db.py` | `scripts/init_db_ck.py` |
 | 调度器 | `scripts/scheduler.py` | `scripts/scheduler_ck.py` |
 

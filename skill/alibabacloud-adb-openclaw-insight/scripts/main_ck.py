@@ -32,6 +32,56 @@ else:
     builtins.print = _flushed_print
 
 
+def _parse_extra_args(args: list[str]) -> dict[str, str]:
+    """Parse extra CLI arguments like --user, --from, --to, --run-id."""
+    result: dict[str, str] = {}
+    index = 0
+    while index < len(args):
+        if args[index] == "--user" and index + 1 < len(args):
+            result["user"] = args[index + 1]
+            index += 2
+        elif args[index] == "--from" and index + 1 < len(args):
+            result["from"] = args[index + 1]
+            index += 2
+        elif args[index] == "--to" and index + 1 < len(args):
+            result["to"] = args[index + 1]
+            index += 2
+        elif args[index] == "--run-id" and index + 1 < len(args):
+            result["run-id"] = args[index + 1]
+            index += 2
+        else:
+            index += 1
+    return result
+
+
+def _validate_date_format(date_string: str) -> bool:
+    """Accept YYYY-MM-DD or YYYY-MM-DD HH:MM:SS (with optional fractional seconds)."""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            datetime.strptime(date_string.split(".")[0], fmt)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _build_time_range(cli_args: dict[str, str], analysis_config) -> "TimeRange":
+    """Build a TimeRange from CLI args, falling back to config defaults."""
+    from scripts.types import TimeRange, last_n_days_range
+
+    if cli_args.get("from") and cli_args.get("to"):
+        if not _validate_date_format(cli_args["from"]) or not _validate_date_format(cli_args["to"]):
+            print("❌ Invalid date format. Please use: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS")
+            sys.exit(1)
+        return TimeRange(start_date=cli_args["from"], end_date=cli_args["to"])
+    elif cli_args.get("from") or cli_args.get("to"):
+        print("❌ Both --from and --to must be provided together")
+        sys.exit(1)
+
+    window_days = analysis_config.analysis_window_days if analysis_config else 7
+    return last_n_days_range(window_days)
+
+
 async def main() -> None:
     from concurrent.futures import ThreadPoolExecutor
     loop = asyncio.get_running_loop()
@@ -40,7 +90,6 @@ async def main() -> None:
     from scripts.config_ck import load_config_ck
     from scripts.collect_logs_ck import collect_logs
     from scripts.analyze_usage_ck import run_full_analysis
-    from scripts.analysis.insight_logic_docs import get_insight_logic_doc
     from scripts.db_ck import close_connection_pool
 
     print("=" * 60)
@@ -61,6 +110,9 @@ async def main() -> None:
 
     command = sys.argv[1] if len(sys.argv) > 1 else "serve"
 
+    # Parse extra arguments (--from, --to, --user, --run-id) from argv[2:]
+    extra_args = _parse_extra_args(sys.argv[2:])
+
     if command == "collect":
         print("\n📥 Running one-time log collection (ClickHouse)...")
         await collect_logs(config)
@@ -68,7 +120,9 @@ async def main() -> None:
 
     elif command == "analyze":
         print("\n📊 Running one-time usage analysis (ClickHouse)...")
-        await run_full_analysis(config)
+        range_ = _build_time_range(extra_args, config.analysis)
+        print(f"  Time range: {range_.start_date} → {range_.end_date}")
+        await run_full_analysis(config, range_)
         close_connection_pool()
 
     elif command == "final-report":
@@ -79,9 +133,24 @@ async def main() -> None:
         print(report_text)
         close_connection_pool()
 
+    elif command == "report":
+        run_id = extra_args.get("run-id") or (sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else None)
+        if not run_id:
+            print("❌ Run ID is required.")
+            print("Usage: python -m scripts.main_ck report <run_id>")
+            print("       python -m scripts.main_ck report --run-id <run_id>")
+            sys.exit(1)
+        print(f"\n📊 Generating report for run_id: {run_id}")
+        from scripts.analysis.orchestrator_ck import AnalysisOrchestratorCk
+        orchestrator = AnalysisOrchestratorCk(config)
+        orchestrator.generate_report(run_id)
+        close_connection_pool()
+
     elif command == "describe-metrics":
         print("\n📘 Reading local insight metrics logic document...")
-        print(get_insight_logic_doc())
+        from scripts.analysis.insight_logic_docs import generate_insight_logic_doc
+        doc = await generate_insight_logic_doc(config)
+        print(doc)
         close_connection_pool()
 
     else:
