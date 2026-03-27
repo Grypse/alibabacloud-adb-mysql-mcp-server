@@ -40,9 +40,13 @@ from scripts.analysis.behavior_insight_ck import (
 from scripts.analysis.organizational_insight_ck import (
     run_l3_independent_cases_no_tech_stack,
     discover_skill_candidates,
+    generate_html_report,
+)
+# Report generation uses the template-based (non-LLM) functions from the ADB
+# module — they are pure Python and database-agnostic.
+from scripts.analysis.organizational_insight import (
     generate_narrative_report,
     generate_structured_report,
-    generate_html_report,
 )
 
 RESULTS_TABLE = "openclaw_analysis_results"
@@ -590,7 +594,7 @@ class AnalysisOrchestratorCk:
                 "l2": l2_results,
                 "l3": l3_results,
             }
-            result = generate_narrative_report(all_results, range_)
+            result = generate_structured_report(all_results, range_)
 
             report_text = result.get("report", "")
             summary = f"最终报告已生成，共 {len(report_text)} 字符"
