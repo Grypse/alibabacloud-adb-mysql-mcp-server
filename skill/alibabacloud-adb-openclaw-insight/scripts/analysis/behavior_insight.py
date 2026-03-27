@@ -94,11 +94,36 @@ def _extract_user_message(raw_content: str) -> str:
         search_pos = last_metadata_end
 
     if last_metadata_end > 0:
-        extracted = raw_content[last_metadata_end:].strip()
-        return extracted if extracted else raw_content.strip()
+        result = raw_content[last_metadata_end:].strip()
+    else:
+        result = raw_content.strip()
 
-    return raw_content.strip()
+    # ── DingTalk: remove quoted-message markers ──
+    # e.g. [这是一条引用消息，原消息ID: msgoJDDVMOZ1TxomDOxpb+Pmw==]
+    result = re.sub(r'\[这是一条引用消息，原消息ID:\s*[^\]]*\]', '', result)
 
+    # ── Feishu: remove [message_id: om_xxx] lines ──
+    result = re.sub(r'\[message_id:\s*[^\]]*\]', '', result)
+
+    # ── Feishu: remove [System: ...] lines ──
+    result = re.sub(r'\[System:\s*[^\]]*\]', '', result)
+
+    # ── Feishu: extract actual message from "sender_id: message" pattern ──
+    # After metadata removal, Feishu messages may have multiple lines like:
+    #   ou_df95fab4179f4be2b0b7870a4661cb0f: 给自己出个迷语
+    # Strip all sender prefixes (ou_xxx: or numeric_id: ) at line beginnings
+    result = result.strip()
+    cleaned_lines = []
+    for line in result.split('\n'):
+        stripped_line = re.sub(r'^(?:ou_[a-f0-9]+|\d{5,}):\s*', '', line)
+        cleaned_lines.append(stripped_line)
+    result = '\n'.join(cleaned_lines)
+
+    # ── Feishu: remove <at user_id="...">name</at> mention tags ──
+    result = re.sub(r'<at\s+user_id="[^"]*">[^<]*</at>', '', result)
+
+    result = result.strip()
+    return result if result else raw_content.strip()
 
 async def classify_intents(
     adb_config: AdbConfig,

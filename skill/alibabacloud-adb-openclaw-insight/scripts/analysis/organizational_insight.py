@@ -639,11 +639,22 @@ def generate_narrative_report(
                   m.get("avgCostPerSession", "")] for m in by_model],
             ) + "\n")
         if by_user:
+            # Sort by total tokens (input + output) descending, show Top 5
+            top5_users = sorted(
+                by_user,
+                key=lambda u: (u.get("totalInput", 0) or 0) + (u.get("totalOutput", 0) or 0),
+                reverse=True,
+            )[:5]
+            l1_lines.append("**Token 消耗 Top 5 用户：**\n")
             l1_lines.append(_md_table(
-                ["用户", "会话数", "输入", "输出", "成本", "均成本"],
-                [[u.get("senderId", ""), u.get("sessionCount", ""), u.get("totalInput", ""),
-                  u.get("totalOutput", ""), u.get("totalCost", ""),
-                  u.get("avgCostPerSession", "")] for u in by_user],
+                ["用户", "会话数", "输入 token", "输出 token", "总 token", "成本"],
+                [[u.get("senderId", ""),
+                  u.get("sessionCount", ""),
+                  u.get("totalInput", ""),
+                  u.get("totalOutput", ""),
+                  (u.get("totalInput", 0) or 0) + (u.get("totalOutput", 0) or 0),
+                  u.get("totalCost", "")]
+                 for u in top5_users],
             ) + "\n")
 
     # 2.2 Task Chain Depth
@@ -944,14 +955,23 @@ def _format_for_report(all_results: dict) -> str:
               m.get("avgCostPerSession", "")] for m in by_model],
         ) if by_model else ""
         by_user = te.get("byUser", [])
+        # Sort by total tokens descending, cap at Top 5
+        top5_users = sorted(
+            by_user,
+            key=lambda u: (u.get("totalInput", 0) or 0) + (u.get("totalOutput", 0) or 0),
+            reverse=True,
+        )[:5] if by_user else []
         user_table = _md_table(
-            ["sender", "sessions", "input", "output", "out/in", "cache%", "cost", "avg_cost"],
+            ["sender", "sessions", "input", "output", "total_tokens", "cost"],
             [[u.get("senderId", ""), u.get("sessionCount", ""), u.get("totalInput", ""),
-              u.get("totalOutput", ""), u.get("outputInputRatio", ""),
-              u.get("cacheHitRatePct", ""), u.get("totalCost", ""),
-              u.get("avgCostPerSession", "")] for u in by_user],
-        ) if by_user else ""
-        parts = [p for p in [overall_text, model_table, user_table] if p]
+              u.get("totalOutput", ""),
+              (u.get("totalInput", 0) or 0) + (u.get("totalOutput", 0) or 0),
+              u.get("totalCost", "")]
+             for u in top5_users],
+        ) if top5_users else ""
+        parts = [p for p in [overall_text, model_table] if p]
+        if user_table:
+            parts.append(f"Token Top 5 Users:\n{user_table}")
         add("L1-1 Token 消耗与成本效率", "\n\n".join(parts))
 
     # ── L1-2 Session Depth ──
@@ -1317,6 +1337,27 @@ def generate_structured_report(
         ))
         part1_lines.append("")
 
+    # Token consumption Top 5 users
+    by_user_te = te.get("byUser", [])
+    if by_user_te:
+        top5_token_users = sorted(
+            by_user_te,
+            key=lambda u: (u.get("totalInput", 0) or 0) + (u.get("totalOutput", 0) or 0),
+            reverse=True,
+        )[:5]
+        part1_lines.append("**Token 消耗 Top 5 用户：**\n")
+        part1_lines.append(_md_table(
+            ["用户", "会话数", "输入 token", "输出 token", "总 token", "成本"],
+            [[u.get("senderId", ""),
+              u.get("sessionCount", ""),
+              u.get("totalInput", ""),
+              u.get("totalOutput", ""),
+              (u.get("totalInput", 0) or 0) + (u.get("totalOutput", 0) or 0),
+              u.get("totalCost", "")]
+             for u in top5_token_users],
+        ))
+        part1_lines.append("")
+
     # ── 1.2 核心使用场景 ──
     part1_lines.append("### 1.2 核心使用场景\n")
 
@@ -1327,19 +1368,16 @@ def generate_structured_report(
     tech = l3.get("techStack", {})
     techs = tech.get("technologies", [])
 
+    # Only show intent classification results here
+    total_intent_count = sum(intent_dist.values()) if intent_dist else 0
     scenario_rows: list[list] = []
     if intent_dist:
-        for intent_name, count in sorted(intent_dist.items(), key=lambda x: -x[1])[:5]:
-            scenario_rows.append([intent_name, f"{count} 次", "L2-1 意图分类"])
-    if cat_dist:
-        for cat_name, count in sorted(cat_dist.items(), key=lambda x: -x[1])[:3]:
-            scenario_rows.append([cat_name, f"{count} 次", "L2-5 话题聚类"])
-    if techs:
-        for t in techs[:3]:
-            scenario_rows.append([t.get("technology", ""), f"{t.get('sessionCount', '')} 会话", "L3-1 技术栈"])
+        for intent_name, count in sorted(intent_dist.items(), key=lambda x: -x[1]):
+            pct = f"{count / total_intent_count * 100:.1f}%" if total_intent_count else "N/A"
+            scenario_rows.append([intent_name, f"{count} 次（{pct}）"])
 
     if scenario_rows:
-        part1_lines.append(_md_table(["使用场景", "占比/频次", "数据来源"], scenario_rows))
+        part1_lines.append(_md_table(["使用场景", "频次（占比）"], scenario_rows))
         part1_lines.append("")
 
     # Non-work intents
@@ -1369,22 +1407,61 @@ def generate_structured_report(
     if team_avg:
         part1_lines.append(f"**Prompt 质量**：团队平均分 **{_round2(team_avg.get('overall', 'N/A'))}**\n")
 
+    # Build user → top intents lookup from L2-1 byUser data
+    intent_by_user = intents.get("byUser", {})
+
+    def _user_top_intents(sender_id: str, top_n: int = 3) -> str:
+        """Return the top N intent categories for a given user as a comma-separated string."""
+        user_intents = intent_by_user.get(sender_id, {})
+        if not user_intents:
+            return "—"
+        sorted_intents = sorted(user_intents.items(), key=lambda x: -x[1])[:top_n]
+        return ", ".join(f"{name}({count})" for name, count in sorted_intents)
+
     top_users = pq.get("topUsers", [])
     bottom_users = pq.get("bottomUsers", [])
     if top_users:
-        part1_lines.append("Top 用户：" + ", ".join(
-            f"{u.get('senderId', '?')}({_round2(u.get('overall', ''))})" for u in top_users[:3]
-        ) + "\n")
+        part1_lines.append("**Prompt 质量 Top 用户：**\n")
+        part1_lines.append(_md_table(
+            ["用户", "综合分", "主要使用场景", "最佳 Prompt 预览"],
+            [[str(u.get("senderId") or "?"),
+              _round2(u.get("overall", "")),
+              _user_top_intents(str(u.get("senderId") or "")),
+              (u.get("bestPrompt", {}).get("content", "") or "")[:80]]
+             for u in top_users[:3]],
+        ))
+        part1_lines.append("")
     if bottom_users:
-        part1_lines.append("Bottom 用户：" + ", ".join(
-            f"{u.get('senderId', '?')}({_round2(u.get('overall', ''))})" for u in bottom_users[:3]
-        ) + "\n")
+        part1_lines.append("**Prompt 质量 Bottom 用户：**\n")
+        part1_lines.append(_md_table(
+            ["用户", "综合分", "主要使用场景", "最差 Prompt 预览"],
+            [[str(u.get("senderId") or "?"),
+              _round2(u.get("overall", "")),
+              _user_top_intents(str(u.get("senderId") or "")),
+              (u.get("worstPrompt", {}).get("content", "") or "")[:80]]
+             for u in bottom_users[:3]],
+        ))
+        part1_lines.append("")
 
     # Complexity
     complexity = l2.get("complexity", {})
     comp_dist = complexity.get("distribution", {})
     if comp_dist:
         part1_lines.append(f"\n**任务复杂度分布**：{_kv_lines(comp_dist)}\n")
+
+    # Top 3 most complex tasks from high-cost sessions
+    hc_for_complexity = l1.get("highCostSessions", {}).get("taskChains", [])[:3]
+    if hc_for_complexity:
+        part1_lines.append("**最复杂任务 Top 3**（按成本排序）：\n")
+        part1_lines.append(_md_table(
+            ["用户", "会话", "总成本", "消息数", "工具调用", "错误数", "时长(s)", "成本驱动"],
+            [[str(c.get("senderId") or "?"), str(c.get("sessionId") or ""),
+              _round2(c.get("totalCost", "")), c.get("messageCount", ""),
+              c.get("toolCallCount", ""), c.get("toolErrorCount", ""),
+              c.get("durationSeconds", ""),
+              ", ".join(str(d) for d in c.get("costDrivers", []))]
+             for c in hc_for_complexity],
+        ) + "\n")
 
     # Retry
     retry = l2.get("retryBehavior", {})
