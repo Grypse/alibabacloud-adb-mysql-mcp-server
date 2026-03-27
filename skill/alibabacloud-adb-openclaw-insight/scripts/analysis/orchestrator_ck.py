@@ -330,6 +330,10 @@ class AnalysisOrchestratorCk:
         if analysis_config.generate_html_report and html_report_path.exists():
             print(f"   HTML Report: {html_report_path}")
         print(f"   Total time:  {elapsed_str}")
+        if llm_client:
+            u = llm_client.token_usage
+            print(f"   LLM calls:   {u['call_count']} requests")
+            print(f"   Tokens used: input={u['input_tokens']:,}  output={u['output_tokens']:,}  total={u['total_tokens']:,}")
         print("=" * 60)
 
         return run_id
@@ -586,11 +590,12 @@ class AnalysisOrchestratorCk:
                 "l2": l2_results,
                 "l3": l3_results,
             }
-            result = await generate_structured_report(all_results, range_, llm_client)
-            elapsed = time.time() - start
+            result = generate_narrative_report(all_results, range_)
 
             report_text = result.get("report", "")
             summary = f"最终报告已生成，共 {len(report_text)} 字符"
+
+            elapsed = time.time() - start
 
             self._save_case_result(
                 run_id, "L3-5", "FINAL_REPORT", range_,
@@ -652,7 +657,7 @@ class AnalysisOrchestratorCk:
                 "l2": l2_results,
                 "l3": l3_results,
             }
-            result = await generate_narrative_report(all_results, range_, llm_client)
+            result = generate_narrative_report(all_results, range_)
             elapsed = time.time() - start
 
             report_text = result.get("report", "")

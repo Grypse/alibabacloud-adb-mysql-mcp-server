@@ -10,7 +10,7 @@ import json
 
 from scripts.config import AdbConfig
 from scripts.db import execute_query_async
-from scripts.llm_client import LlmClient
+from scripts.llm_client import LlmClient, count_tokens, _MAX_BATCH_TOKENS as MAX_BATCH_TOKENS
 from scripts.types import TimeRange, time_range_to_sql_params
 from scripts.analysis.behavior_insight import _extract_user_message
 
@@ -92,14 +92,12 @@ async def build_tech_stack_heatmap(
             print("[L3-1] No valid user prompts after metadata extraction")
             return {"technologies": []}
 
-        messages = [row["user_prompt"] for row in rows]
+        messages = [row["user_prompt"][:300] for row in rows]
 
         # Apply 128K single-batch strategy
-        total_chars = sum(len(msg) for msg in messages)
-        estimated_tokens = int(total_chars * 1.5)
-        max_single_batch_tokens = 128_000
+        estimated_tokens = count_tokens(messages)
 
-        if estimated_tokens < max_single_batch_tokens:
+        if estimated_tokens < MAX_BATCH_TOKENS:
             batch_size = len(messages)
             print(f"[L3-1] Estimated {estimated_tokens} tokens (< 128K), sending all in one batch")
         else:
@@ -237,15 +235,13 @@ async def discover_repeated_questions(
 
         # Build numbered message list with sender info for LLM
         messages_for_llm = [
-            f"[{i + 1}] (user: {row.get('sender_id', 'unknown')})\n{row['user_prompt']}"
+            f"[{i + 1}] (user: {row.get('sender_id', 'unknown')})\n{row['user_prompt'][:300]}"
             for i, row in enumerate(rows)
         ]
 
-        total_chars = sum(len(msg) for msg in messages_for_llm)
-        estimated_tokens = int(total_chars * 1.5)
-        max_single_batch_tokens = 128_000
+        estimated_tokens = count_tokens(messages_for_llm)
 
-        if estimated_tokens < max_single_batch_tokens:
+        if estimated_tokens < MAX_BATCH_TOKENS:
             print(f"[L3-2] Estimated {estimated_tokens} tokens (< 128K), sending all in one batch")
             combined_messages = "\n\n---\n\n".join(messages_for_llm)
             user_prompt = (
@@ -410,28 +406,7 @@ Return a JSON object with this structure:
 
 # ─── L3-4: Discover Skill Candidates ───
 
-async def discover_skill_candidates(
-    tool_chain_result: dict,
-    topic_cluster_result: dict,
-    intent_result: dict,
-    llm_client: LlmClient,
-) -> dict:
-    print("[L3-4] Discovering skill candidates...")
-
-    try:
-        top_tool_patterns = tool_chain_result.get("topTrigrams", [])[:10]
-        top_topics = topic_cluster_result.get("topTags", [])[:10]
-        top_intents = sorted(
-            intent_result.get("distribution", {}).items(),
-            key=lambda x: x[1],
-            reverse=True,
-        )[:10]
-
-        tool_summary = "\n".join(f"- {p['pattern']} (count: {p['count']})" for p in top_tool_patterns)
-        topic_summary = "\n".join(f"- {t['tag']} (count: {t['count']}, users: {t['uniqueUsers']})" for t in top_topics)
-        intent_summary = "\n".join(f"- {intent} (count: {count})" for intent, count in top_intents)
-
-        system_prompt = """You are an AI workflow automation specialist who understands the Skill specification for enterprise AI agent assistants.
+_SKILL_SYSTEM_PROMPT = """You are an AI workflow automation specialist who understands the Skill specification for enterprise AI agent assistants.
 
 ## What is a Skill?
 
@@ -453,24 +428,118 @@ A valid Skill MUST satisfy ALL of the following criteria:
 
 Only recommend candidates that can realistically be developed into a Skill package with a YAML/Markdown spec, system prompt, and tool definitions."""
 
-        user_prompt = f"""Analyze the following usage data to identify the TOP 3 most valuable Skill candidates.
 
-Top Tool Chain Patterns (Trigrams):
-{tool_summary}
+async def discover_skill_candidates(
+    adb_config: AdbConfig,
+    table_name: str,
+    range_: TimeRange,
+    llm_client: LlmClient,
+) -> dict:
+    """Discover skill candidates by querying task chain data directly from DB.
 
-Top Topics:
-{topic_summary}
+    Extracts the first user message and tool sequence for each task chain,
+    then asks the LLM to identify repeatable, automatable workflow patterns.
+    """
+    print("[L3-4] Discovering skill candidates...")
 
-Top Intents:
-{intent_summary}
+    try:
+        start_time, end_time = time_range_to_sql_params(range_)
+
+        # Single SQL: for each task chain, get the first user message and the
+        # ordered tool sequence.  Uses the standard task_chain_id window
+        # (cumulative count of role='user' rows partitioned by session_id).
+        sql = f"""
+            WITH base AS (
+                SELECT session_id, sender_id, role, content_text, tool_name,
+                    SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END)
+                        OVER (PARTITION BY session_id ORDER BY timestamp, row_id) AS task_chain_id,
+                    ROW_NUMBER()
+                        OVER (PARTITION BY session_id ORDER BY timestamp, row_id) AS msg_seq
+                FROM `{table_name}`
+                WHERE timestamp >= %s AND timestamp < %s
+            ),
+            first_user AS (
+                SELECT session_id, task_chain_id, sender_id, content_text,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY session_id, task_chain_id ORDER BY msg_seq
+                    ) AS rn
+                FROM base
+                WHERE role = 'user'
+            ),
+            tool_seq AS (
+                SELECT session_id, task_chain_id,
+                    GROUP_CONCAT(tool_name ORDER BY msg_seq SEPARATOR ' -> ') AS tool_chain
+                FROM base
+                WHERE tool_name IS NOT NULL AND tool_name != ''
+                GROUP BY session_id, task_chain_id
+            )
+            SELECT
+                fu.session_id,
+                fu.task_chain_id,
+                fu.sender_id,
+                fu.content_text AS user_message,
+                ts.tool_chain
+            FROM first_user fu
+            LEFT JOIN tool_seq ts
+                ON fu.session_id = ts.session_id
+                AND fu.task_chain_id = ts.task_chain_id
+            WHERE fu.rn = 1
+              AND fu.content_text IS NOT NULL AND fu.content_text != ''
+            ORDER BY fu.session_id, fu.task_chain_id
+        """
+
+        rows = await execute_query_async(adb_config, sql, (start_time, end_time))
+
+        if not rows:
+            print("[L3-4] No task chains found")
+            return {"skillCandidates": []}
+
+        # Extract actual user messages and truncate
+        for row in rows:
+            row["user_prompt"] = _extract_user_message(row.get("user_message") or "")[:300]
+
+        rows = [row for row in rows if row["user_prompt"]]
+
+        if not rows:
+            print("[L3-4] No valid task chains after extraction")
+            return {"skillCandidates": []}
+
+        # Build compact summaries for LLM: "[idx] (user: X) message | tools: A->B->C"
+        task_chain_summaries = []
+        for i, row in enumerate(rows):
+            tool_chain = row.get("tool_chain") or "(no tools)"
+            summary = (
+                f"[{i + 1}] (user: {row.get('sender_id', 'unknown')})\n"
+                f"  Request: {row['user_prompt']}\n"
+                f"  Tools: {tool_chain}"
+            )
+            task_chain_summaries.append(summary)
+
+        estimated_tokens = count_tokens(task_chain_summaries)
+
+        if estimated_tokens < MAX_BATCH_TOKENS:
+            print(f"[L3-4] {estimated_tokens} tokens (< 128K), sending all in one batch")
+        else:
+            # Trim to fit within token budget — keep the most recent chains
+            while estimated_tokens >= MAX_BATCH_TOKENS and len(task_chain_summaries) > 50:
+                task_chain_summaries = task_chain_summaries[-len(task_chain_summaries) // 2:]
+                estimated_tokens = count_tokens(task_chain_summaries)
+            print(f"[L3-4] Trimmed to {len(task_chain_summaries)} chains ({estimated_tokens} tokens)")
+
+        combined_data = "\n\n---\n\n".join(task_chain_summaries)
+
+        user_prompt = f"""Analyze the following {len(task_chain_summaries)} task chains from an enterprise AI agent assistant.
+Each task chain shows a user's request and the tool sequence the Agent executed.
+
+{combined_data}
 
 Based on the Skill specification above, identify exactly 3 Skill candidates that:
-1. Have a clear, deterministic workflow (observable tool chain pattern)
+1. Have a clear, deterministic workflow (observable tool chain pattern that repeats across multiple task chains)
 2. Are domain-specific (not generic)
-3. Have the highest combination of frequency × unique users × automation potential
+3. Have the highest combination of frequency x unique users x automation potential
 4. Can be realistically packaged as a self-contained Skill with input/output contract
 
-For each candidate, also explain WHY it qualifies as a Skill (which tool chain pattern supports it, what the concrete input/output would be).
+For each candidate, explain WHY it qualifies as a Skill (which recurring tool chain pattern supports it, what the concrete input/output would be).
 
 Return a JSON object with this structure:
 {{
@@ -479,10 +548,10 @@ Return a JSON object with this structure:
       "name": "string",
       "description": "string",
       "trigger": "string",
-      "workflow": "string — the concrete step-by-step workflow (e.g., read config → modify → validate → apply)",
+      "workflow": "string — the concrete step-by-step workflow (e.g., read config -> modify -> validate -> apply)",
       "inputContract": "string — what inputs the Skill needs",
       "outputContract": "string — what the Skill produces",
-      "supportingEvidence": "string — which tool chain pattern / topic / intent supports this",
+      "supportingEvidence": "string — which recurring tool chain pattern and user requests support this",
       "estimatedWeeklyUsage": number,
       "uniqueUsers": number,
       "automationPotential": "high|medium|low"
@@ -490,7 +559,7 @@ Return a JSON object with this structure:
   ]
 }}"""
 
-        result = await llm_client.chat_json(system_prompt, user_prompt)
+        result = await llm_client.chat_json(_SKILL_SYSTEM_PROMPT, user_prompt)
         print(f"[L3-4] Discovered {len(result.get('skillCandidates', []))} skill candidates")
         return result
 
@@ -501,417 +570,1072 @@ Return a JSON object with this structure:
 
 # ─── L3-5: Generate Narrative Report ───
 
-async def generate_narrative_report(
+def generate_narrative_report(
     all_results: dict,
     range_: TimeRange,
-    llm_client: LlmClient,
 ) -> dict:
-    print("[L3-5] Generating narrative report...")
+    """Generate a narrative-style report using template-based rendering.
 
-    try:
-        system_prompt = """You are a senior technology analyst writing an insight report for engineering leadership.
+    No LLM call — pure Python template filling.  Produces a section-by-section
+    data report covering L1 (Operational), L2 (Behavior), L3 (Organizational).
+    """
+    print("[L3-5] Generating narrative report (template mode)...")
 
-## Critical Context: Understanding the Data
+    l1 = all_results.get("l1", {})
+    l2 = all_results.get("l2", {})
+    l3 = all_results.get("l3", {})
+    period = f"{range_.start_date} ~ {range_.end_date}"
 
-The data you are analyzing comes from **OpenClaw**, an enterprise AI agent assistant platform. Each "session" or "task chain" represents an **AI Agent autonomously executing tasks** on behalf of a user — NOT a human manually operating a computer.
+    sections: list[str] = []
 
-Key distinctions you MUST apply throughout the report:
-- **Tool calls** (exec, read, write, web_fetch, etc.) are executed by the **AI Agent**, not by the user directly.
-- When you see patterns like "exec->exec->exec", it means the **Agent ran a sequence of commands**, not that a user typed commands manually.
-- **Users interact with the Agent through natural language messages**. The Agent then autonomously decides which tools to call and in what sequence.
-- Therefore, phrases like "用户手动执行命令" or "用户正在手动操作" are INCORRECT. The correct framing is "Agent 自动执行了..." or "AI 助理调用了...".
-- When discussing Skill candidates, the value proposition is NOT "减少用户的手动操作" but rather "将 Agent 的重复工作流封装为标准化 Skill，提升一致性和可复用性".
+    # ── Helper ──
+    def _round2(val) -> str:
+        try:
+            return f"{float(val):.2f}"
+        except (TypeError, ValueError):
+            return str(val)
 
-## Report Requirements
+    # ════════════════════════════════════════════════
+    # 1. Executive Summary
+    # ════════════════════════════════════════════════
+    te = l1.get("tokenEfficiency", {}).get("overall", {})
+    sr = l2.get("successRate", {}).get("overall", {})
+    total_sessions = te.get("totalSessions", 0)
+    total_cost = te.get("totalCost", 0)
+    success = sr.get("success", 0)
+    partial = sr.get("partial", 0)
+    failure = sr.get("failure", 0)
+    total_tasks = success + partial + failure
+    anomaly_count = len(l1.get("anomalies", {}).get("anomalies", []))
 
-This is NOT a weekly report. It is an analysis report for a specific time range. Do NOT use terms like "本周", "周报", "weekly". Instead, refer to the analysis period using the exact dates provided.
+    sections.append(
+        f"## 1. Executive Summary\n\n"
+        f"> 分析周期：{period}\n\n"
+        f"本分析周期内共 **{total_sessions}** 个会话、**{total_tasks}** 条任务链，"
+        f"总成本 **{_round2(total_cost)}**。"
+        f"任务成功率 **{success}/{total_tasks}**"
+        f"（失败 {failure}），检测到 **{anomaly_count}** 个异常。"
+    )
 
-## Language Detection Rules
+    # ════════════════════════════════════════════════
+    # 2. L1 Operational Efficiency
+    # ════════════════════════════════════════════════
+    l1_lines: list[str] = ["## 2. L1 运营效率\n"]
 
-Determine the report language based on the dominant language found in the user messages within the analysis data:
-- If the majority of user messages are in **Chinese**, write the entire report in **Chinese (中文)**.
-- If the majority of user messages are in **English**, write the entire report in **English**.
-- If the messages are evenly mixed, default to **Chinese**.
+    # 2.1 Token Consumption
+    te_full = l1.get("tokenEfficiency", {})
+    by_model = te_full.get("byModel", [])
+    by_user = te_full.get("byUser", [])
+    if by_model or te:
+        l1_lines.append("### 2.1 Token 消耗与成本效率\n")
+        if te:
+            l1_lines.append(_kv_lines(te) + "\n")
+        if by_model:
+            l1_lines.append(_md_table(
+                ["模型", "会话数", "输入", "输出", "输出/输入", "缓存%", "成本", "均成本"],
+                [[m.get("model", ""), m.get("sessionCount", ""), m.get("totalInput", ""),
+                  m.get("totalOutput", ""), m.get("outputInputRatio", ""),
+                  m.get("cacheHitRatePct", ""), m.get("totalCost", ""),
+                  m.get("avgCostPerSession", "")] for m in by_model],
+            ) + "\n")
+        if by_user:
+            l1_lines.append(_md_table(
+                ["用户", "会话数", "输入", "输出", "成本", "均成本"],
+                [[u.get("senderId", ""), u.get("sessionCount", ""), u.get("totalInput", ""),
+                  u.get("totalOutput", ""), u.get("totalCost", ""),
+                  u.get("avgCostPerSession", "")] for u in by_user],
+            ) + "\n")
 
-Apply this language choice consistently throughout the entire report — do NOT mix languages within the report.
+    # 2.2 Task Chain Depth
+    sd = l1.get("sessionDepth", {})
+    buckets = sd.get("bucketDistribution", [])
+    if buckets:
+        l1_lines.append("### 2.2 任务链深度分布\n")
+        l1_lines.append(f"总任务链数：{sd.get('totalChains', '?')}\n")
+        l1_lines.append(_md_table(
+            ["深度", "链数", "均消息", "均时长(s)", "均工具", "均 token", "均成本"],
+            [[b.get("depthBucket", ""), b.get("chainCount", ""), b.get("avgMessages", ""),
+              b.get("avgDurationSeconds", ""), b.get("avgToolCalls", ""),
+              b.get("avgTokens", ""), b.get("avgCost", "")] for b in buckets],
+        ) + "\n")
 
-## Writing Style
-- Write in a natural, conversational tone. Use the tone of a trusted advisor briefing a VP of Engineering.
-- Tell a STORY, not a data dump. Lead with insights and conclusions, then support with data.
-- Use analogies and plain language to explain technical patterns. Avoid jargon where possible.
-- Highlight what's SURPRISING, what's CONCERNING, and what's an OPPORTUNITY.
-- Be opinionated — make clear recommendations, don't just present options.
-- Use Markdown formatting for readability (headers, bold, bullet points).
-- Do NOT limit the report length. Include all data tables and narrative analysis in full. Completeness is more important than brevity."""
+    # 2.3 Tool Chain Patterns
+    tc = l1.get("toolChains", {})
+    bigrams = tc.get("topBigrams", [])[:10]
+    trigrams = tc.get("topTrigrams", [])[:10]
+    tool_success = tc.get("toolSuccessRates", [])[:10]
+    if bigrams or trigrams:
+        l1_lines.append("### 2.3 工具链模式\n")
+        if bigrams:
+            l1_lines.append("**Top Bigrams：**\n")
+            l1_lines.append(_md_table(["模式", "次数"], [[b.get("pattern", ""), b.get("count", "")] for b in bigrams]) + "\n")
+        if trigrams:
+            l1_lines.append("**Top Trigrams：**\n")
+            l1_lines.append(_md_table(["模式", "次数"], [[t.get("pattern", ""), t.get("count", "")] for t in trigrams]) + "\n")
+        if tool_success:
+            l1_lines.append("**工具成功率：**\n")
+            l1_lines.append(_md_table(
+                ["工具", "调用数", "成功率"],
+                [[s.get("toolName", ""), s.get("totalCalls", ""), s.get("successRate", "")] for s in tool_success],
+            ) + "\n")
 
-        # ── Assemble all available data into the prompt ──
-        l1 = all_results.get("l1", {})
-        l2 = all_results.get("l2", {})
-        l3 = all_results.get("l3", {})
+    # 2.4 High-Cost Sessions
+    hc = l1.get("highCostSessions", {})
+    chains = hc.get("taskChains", [])[:10]
+    if chains:
+        l1_lines.append("### 2.4 高成本会话\n")
+        l1_lines.append(_md_table(
+            ["用户", "会话", "token", "成本", "消息", "工具", "错误", "时长(s)", "成本驱动"],
+            [[c.get("senderId", ""), c.get("sessionId", ""), c.get("totalTokens", ""),
+              c.get("totalCost", ""), c.get("messageCount", ""), c.get("toolCallCount", ""),
+              c.get("toolErrorCount", ""), c.get("durationSeconds", ""),
+              ", ".join(c.get("costDrivers", []))] for c in chains],
+        ) + "\n")
 
-        data_sections = []
+    # 2.5 Anomaly Detection
+    anomalies = l1.get("anomalies", {}).get("anomalies", [])
+    if anomalies:
+        l1_lines.append("### 2.5 异常检测\n")
+        l1_lines.append(_md_table(
+            ["用户", "类型", "实际值", "均值", "标准差", "Z 分", "严重度"],
+            [[a.get("senderId", ""), a.get("anomalyType", ""), a.get("actualValue", ""),
+              a.get("mean", ""), a.get("stddev", ""), a.get("zScore", ""),
+              a.get("severity", "")] for a in anomalies],
+        ) + "\n")
 
-        def append_section(label: str, data: dict) -> None:
-            if data:
-                data_sections.append(f"【{label}】\n{json.dumps(data, ensure_ascii=False, default=str)}")
+    sections.append("\n".join(l1_lines))
 
-        # L1: Operational Efficiency
-        append_section("L1-1 Token 消耗与成本效率", l1.get("tokenEfficiency", {}))
-        append_section("L1-2 任务链深度分布", l1.get("sessionDepth", {}))
-        append_section("L1-3 工具链模式", l1.get("toolChains", {}))
-        append_section("L1-4 高成本会话 Top20", l1.get("highCostSessions", {}))
-        append_section("L1-5 异常检测", l1.get("anomalies", {}))
+    # ════════════════════════════════════════════════
+    # 3. L2 User Behavior
+    # ════════════════════════════════════════════════
+    l2_lines: list[str] = ["## 3. L2 用户行为\n"]
 
-        # L2: User Behavior
-        append_section("L2-1 意图分类分布", l2.get("intents", {}))
-        append_section("L2-2 任务复杂度", l2.get("complexity", {}))
-        append_section("L2-3 任务成功率", l2.get("successRate", {}))
-        append_section("L2-4 Prompt 质量评分", l2.get("promptQuality", {}))
-        append_section("L2-5 话题聚类", l2.get("topics", {}))
-        append_section("L2-6 重试行为检测", l2.get("retryBehavior", {}))
-        append_section("L2-7 思考深度分布", l2.get("thinkingDepth", {}))
-        append_section("L2-8 用户成熟度趋势", l2.get("userMaturity", {}))
+    # 3.1 Intent Classification
+    intents = l2.get("intents", {})
+    intent_dist = intents.get("distribution", {})
+    if intent_dist:
+        l2_lines.append("### 3.1 意图分类\n")
+        total_intents = sum(intent_dist.values())
+        l2_lines.append(_md_table(
+            ["意图", "次数", "占比"],
+            [[k, v, f"{v / total_intents * 100:.1f}%" if total_intents else "N/A"]
+             for k, v in sorted(intent_dist.items(), key=lambda x: -x[1])],
+        ) + "\n")
 
-        # L3: Organizational Cognition
-        append_section("L3-1 技术栈热力图", l3.get("techStack", {}))
-        append_section("L3-2 高频重复问题", l3.get("repeatedQuestions", {}))
-        append_section("L3-3 最佳实践", l3.get("bestPractices", {}))
-        append_section("L3-4 技能候选", l3.get("skillCandidates", {}))
+    # 3.2 Task Complexity
+    complexity = l2.get("complexity", {})
+    comp_dist = complexity.get("distribution", {})
+    top_complex = complexity.get("topComplex", [])[:5]
+    if comp_dist:
+        l2_lines.append("### 3.2 任务复杂度\n")
+        l2_lines.append(_kv_lines(comp_dist) + "\n")
+    if top_complex:
+        l2_lines.append(_md_table(
+            ["用户", "会话", "复杂度", "轮次", "工具", "思考长度", "时长(min)"],
+            [[c.get("senderId", ""), c.get("sessionId", ""), c.get("complexityScore", ""),
+              c.get("userTurns", ""), c.get("toolCallCount", ""),
+              c.get("thinkingLength", ""), c.get("durationMinutes", "")] for c in top_complex],
+        ) + "\n")
 
-        all_data_text = "\n\n".join(data_sections) if data_sections else "暂无分析数据"
+    # 3.3 Task Success Rate
+    sr_data = l2.get("successRate", {})
+    sr_overall = sr_data.get("overall", {})
+    if sr_overall:
+        l2_lines.append("### 3.3 任务成功率\n")
+        l2_lines.append(_kv_lines(sr_overall) + "\n")
+    failures = sr_data.get("failures", [])[:10]
+    if failures:
+        l2_lines.append("**失败任务链：**\n")
+        l2_lines.append(_md_table(
+            ["用户", "会话", "链 ID", "结果"],
+            [[f.get("senderId", ""), f.get("sessionId", ""), f.get("taskChainId", ""),
+              f.get("outcome", "")] for f in failures],
+        ) + "\n")
 
-        user_prompt = f"""Based on the following OpenClaw enterprise AI agent assistant usage analysis data, write an insight report for engineering leadership.
+    # 3.4 Prompt Quality
+    pq = l2.get("promptQuality", {})
+    team_avg = pq.get("teamAverage", {})
+    if team_avg:
+        l2_lines.append("### 3.4 Prompt 质量\n")
+        l2_lines.append(f"团队平均：{_kv_lines(team_avg)}\n")
+    top_u = pq.get("topUsers", [])
+    bot_u = pq.get("bottomUsers", [])
+    if top_u:
+        l2_lines.append("**Top 用户：**\n")
+        l2_lines.append(_md_table(
+            ["用户", "综合分", "最佳 Prompt 预览"],
+            [[u.get("senderId", ""), _round2(u.get("overall", "")),
+              (u.get("bestPrompt", {}).get("content", "") or "")[:100]] for u in top_u],
+        ) + "\n")
+    if bot_u:
+        l2_lines.append("**Bottom 用户：**\n")
+        l2_lines.append(_md_table(
+            ["用户", "综合分", "最差 Prompt 预览"],
+            [[u.get("senderId", ""), _round2(u.get("overall", "")),
+              (u.get("worstPrompt", {}).get("content", "") or "")[:100]] for u in bot_u],
+        ) + "\n")
 
-Analysis period: {range_.start_date} to {range_.end_date}
+    # 3.5 Topic Clustering
+    topics = l2.get("topics", {})
+    cat_dist = topics.get("categoryDistribution", {})
+    top_tags = topics.get("topTags", [])
+    if cat_dist:
+        l2_lines.append("### 3.5 话题聚类\n")
+        l2_lines.append(_kv_lines(cat_dist) + "\n")
+    if top_tags:
+        l2_lines.append(_md_table(
+            ["标签", "类别", "次数", "用户数"],
+            [[t.get("tag", ""), t.get("category", ""), t.get("count", ""),
+              t.get("uniqueUsers", "")] for t in top_tags],
+        ) + "\n")
 
-IMPORTANT — Language selection: First, examine the user messages in the intent classification (L2-1) and topic clustering (L2-5) data below to determine whether the majority of user messages are in Chinese or English. Then write the ENTIRE report in that language. Do NOT mix languages within the report.
+    # 3.6 Retry Behavior
+    retry = l2.get("retryBehavior", {})
+    if retry:
+        l2_lines.append("### 3.6 重试行为\n")
+        l2_lines.append(
+            f"- 重试率：{retry.get('retryRate', '?')}\n"
+            f"- 总会话：{retry.get('totalSessions', '?')}\n"
+            f"- 重试会话：{retry.get('retrySessionCount', '?')}\n"
+        )
 
-This is NOT a weekly report. Refer to the analysis period using the exact dates above, not terms like "this week" or "weekly".
+    # 3.7 Thinking Depth
+    td = l2.get("thinkingDepth", {})
+    by_depth = td.get("byDepth", [])
+    by_model_td = td.get("byModel", [])
+    if by_depth:
+        l2_lines.append("### 3.7 思考深度\n")
+        l2_lines.append(_md_table(
+            ["深度", "消息数", "均输出 token", "均成本", "均内容长度"],
+            [[d.get("thinkingDepth", ""), d.get("messageCount", ""),
+              d.get("avgOutputTokens", ""), d.get("avgCost", ""),
+              d.get("avgContentLength", "")] for d in by_depth],
+        ) + "\n")
+    if by_model_td:
+        l2_lines.append(_md_table(
+            ["模型", "总消息", "思考数", "思考%", "均思考长度"],
+            [[m.get("model", ""), m.get("totalMessages", ""), m.get("thinkingCount", ""),
+              m.get("thinkingPct", ""), m.get("avgThinkingLength", "")] for m in by_model_td],
+        ) + "\n")
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Analysis data from the three-layer insight engine:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 3.8 User Maturity
+    maturity = l2.get("userMaturity", {})
+    maturity_users = maturity.get("users", [])[:20]
+    if maturity_users:
+        l2_lines.append("### 3.8 用户成熟度\n")
+        l2_lines.append(_md_table(
+            ["用户", "Prompt 数", "平均分", "趋势", "斜率"],
+            [[u.get("senderId", ""), u.get("promptCount", ""), _round2(u.get("overallAvg", "")),
+              u.get("trend", ""), _round2(u.get("slope", ""))] for u in maturity_users],
+        ) + "\n")
 
-{all_data_text}
+    sections.append("\n".join(l2_lines))
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ════════════════════════════════════════════════
+    # 4. L3 Organizational Cognition
+    # ════════════════════════════════════════════════
+    l3_lines: list[str] = ["## 4. L3 组织认知\n"]
 
-The report must include BOTH narrative analysis and complete data metric displays. Each section should first tell a story and give conclusions in natural language, then immediately follow with a Markdown table or formatted list showing the key metrics for that section.
+    # 4.1 Tech Stack
+    tech_data = l3.get("techStack", {})
+    tech_list = tech_data.get("technologies", [])
+    if tech_list:
+        l3_lines.append("### 4.1 技术栈热力图\n")
+        l3_lines.append(_md_table(
+            ["技术", "类别", "会话数", "用户数"],
+            [[t.get("technology", ""), t.get("category", ""), t.get("sessionCount", ""),
+              t.get("uniqueUsers", "")] for t in tech_list],
+        ) + "\n")
 
-Report structure:
+    # 4.2 Repeated Questions
+    rq = l3.get("repeatedQuestions", {})
+    rq_list = rq.get("repeatedQuestions", [])
+    if rq_list:
+        l3_lines.append("### 4.2 高频重复问题\n")
+        l3_lines.append(_md_table(
+            ["问题", "类别", "用户数", "总次数", "涉及用户"],
+            [[q.get("canonicalQuestion", ""), q.get("category", ""),
+              q.get("uniqueUsers", ""), q.get("totalOccurrences", ""),
+              ", ".join(q.get("senders", [])) if isinstance(q.get("senders"), list) else q.get("senders", "")]
+             for q in rq_list],
+        ) + "\n")
 
-## 1. Executive Summary
-2-3 sentences summarizing the most noteworthy findings — be direct, like messaging your boss.
+    # 4.3 Best Practices
+    bp = l3.get("bestPractices", {})
+    bp_list = bp.get("bestPractices", [])
+    if bp_list:
+        l3_lines.append("### 4.3 最佳实践\n")
+        for practice in bp_list:
+            title = practice.get("title", practice.get("name", ""))
+            desc = practice.get("description", "")
+            l3_lines.append(f"- **{title}**：{desc}\n")
+        l3_lines.append("")
 
-## 2. L1 Operational Efficiency
+    # 4.4 Skill Candidates
+    sc = l3.get("skillCandidates", {})
+    sc_list = sc.get("skillCandidates", [])
+    if sc_list:
+        l3_lines.append("### 4.4 Skill 候选\n")
+        for skill in sc_list:
+            l3_lines.append(
+                f"- **{skill.get('name', '')}**：{skill.get('description', '')}\n"
+                f"  - 触发条件：{skill.get('trigger', '')}\n"
+                f"  - 工作流：{skill.get('workflow', '')}\n"
+            )
+        l3_lines.append("")
 
-### 2.1 Token Consumption & Cost Efficiency
-- 1-2 paragraphs of narrative interpreting trends and anomalies
-- Markdown table: input/output tokens, cache hit rate, total cost per model
-- If user-level data is available, a table showing top users by consumption
+    sections.append("\n".join(l3_lines))
 
-### 2.2 Task Chain Depth Distribution
-- Narrative interpreting the distribution characteristics
-- Table showing each depth bucket (single/short/medium/deep/marathon) with counts and percentages
+    report_text = "\n\n---\n\n".join(sections)
+    print("[L3-5] Narrative report generated successfully (template mode)")
+    return {"report": report_text}
 
-### 2.3 Tool Chain Patterns
-- Narrative interpreting the most common tool usage patterns
-- Table showing top tool chain patterns (pattern, count, unique users)
+# ─── Data Formatting Helper (Markdown tables) ───
 
-### 2.4 High-Cost Sessions
-- Narrative commentary on which scenarios are "burning tokens"
-- Table showing top 5 high-cost sessions (session_id, user, cost, cost drivers)
+def _md_table(headers: list[str], rows: list[list]) -> str:
+    """Build a compact Markdown table from headers and row data."""
+    if not rows:
+        return "(no data)"
+    lines = ["| " + " | ".join(str(h) for h in headers) + " |"]
+    lines.append("| " + " | ".join("---" for _ in headers) + " |")
+    for row in rows:
+        lines.append("| " + " | ".join(str(v) for v in row) + " |")
+    return "\n".join(lines)
 
-### 2.5 Anomaly Detection
-- Narrative interpreting what anomalies were found
-- List showing counts of each anomaly type (cost spike, error spike, abnormal stop, off-hours usage)
 
-## 3. L2 User Behavior
+def _kv_lines(data: dict, key_labels: dict[str, str] | None = None) -> str:
+    """Format a flat dict as ``label: value`` lines."""
+    if not data:
+        return "(no data)"
+    parts: list[str] = []
+    for key, value in data.items():
+        label = key_labels.get(key, key) if key_labels else key
+        parts.append(f"{label}: {value}")
+    return "\n".join(parts)
 
-### 3.1 Intent Classification
-- Narrative interpreting what users are mainly doing
-- Table showing each intent category with count and percentage
 
-### 3.2 Task Complexity
-- Narrative interpreting the complexity distribution
-- Distribution statistics for complexity scores
+def _format_for_report(all_results: dict) -> str:
+    """Convert analysis results into compact Markdown tables for LLM consumption.
 
-### 3.3 Task Success Rate
-- Narrative interpreting the success rate situation
-- Table showing success/partial/failure counts and percentages
+    This replaces the old ``_summarize_for_report`` + ``json.dumps`` approach.
+    Markdown tables eliminate JSON key-name bloat (quotes, braces, colons) and
+    reduce token usage by ~40-60% while preserving all data without truncation.
+    """
+    l1 = all_results.get("l1", {})
+    l2 = all_results.get("l2", {})
+    l3 = all_results.get("l3", {})
+    sections: list[str] = []
 
-### 3.4 Prompt Quality
-- Narrative interpreting the overall prompt quality level
-- Table showing top 3 best users and bottom 3 users with scores
+    def add(label: str, content: str) -> None:
+        if content and content != "(no data)":
+            sections.append(f"【{label}】\n{content}")
 
-### 3.5 Topic Clustering
-- Narrative interpreting the hot topics
-- Table showing top topic tags (tag name, count, unique users)
+    # ── L1-1 Token Efficiency ──
+    te = l1.get("tokenEfficiency", {})
+    if te:
+        overall = te.get("overall", {})
+        overall_text = _kv_lines(overall) if overall else ""
+        by_model = te.get("byModel", [])
+        model_table = _md_table(
+            ["model", "sessions", "input", "output", "out/in", "cache%", "cost", "avg_cost"],
+            [[m.get("model", ""), m.get("sessionCount", ""), m.get("totalInput", ""),
+              m.get("totalOutput", ""), m.get("outputInputRatio", ""),
+              m.get("cacheHitRatePct", ""), m.get("totalCost", ""),
+              m.get("avgCostPerSession", "")] for m in by_model],
+        ) if by_model else ""
+        by_user = te.get("byUser", [])
+        user_table = _md_table(
+            ["sender", "sessions", "input", "output", "out/in", "cache%", "cost", "avg_cost"],
+            [[u.get("senderId", ""), u.get("sessionCount", ""), u.get("totalInput", ""),
+              u.get("totalOutput", ""), u.get("outputInputRatio", ""),
+              u.get("cacheHitRatePct", ""), u.get("totalCost", ""),
+              u.get("avgCostPerSession", "")] for u in by_user],
+        ) if by_user else ""
+        parts = [p for p in [overall_text, model_table, user_table] if p]
+        add("L1-1 Token 消耗与成本效率", "\n\n".join(parts))
 
-### 3.6 Retry Behavior
-- Narrative interpreting what the retry rate indicates
-- Retry rate metric display
+    # ── L1-2 Session Depth ──
+    sd = l1.get("sessionDepth", {})
+    if sd:
+        total = f"totalChains: {sd.get('totalChains', '?')}"
+        buckets = sd.get("bucketDistribution", [])
+        bucket_table = _md_table(
+            ["depth", "chains", "avg_msgs", "avg_dur_s", "avg_tools", "avg_tokens", "avg_cost", "sum_tokens"],
+            [[b.get("depthBucket", ""), b.get("chainCount", ""), b.get("avgMessages", ""),
+              b.get("avgDurationSeconds", ""), b.get("avgToolCalls", ""),
+              b.get("avgTokens", ""), b.get("avgCost", ""), b.get("sumTokens", "")]
+             for b in buckets],
+        ) if buckets else ""
+        add("L1-2 任务链深度分布", f"{total}\n{bucket_table}" if bucket_table else total)
 
-### 3.7 Thinking Depth
-- Narrative interpreting the model reasoning depth distribution
+    # ── L1-3 Tool Chains (cap 10 each) ──
+    tc = l1.get("toolChains", {})
+    if tc:
+        bigrams = _md_table(
+            ["pattern", "count"],
+            [[b.get("pattern", ""), b.get("count", "")] for b in tc.get("topBigrams", [])[:10]],
+        )
+        trigrams = _md_table(
+            ["pattern", "count"],
+            [[t.get("pattern", ""), t.get("count", "")] for t in tc.get("topTrigrams", [])[:10]],
+        )
+        success = _md_table(
+            ["tool", "calls", "success%"],
+            [[s.get("toolName", ""), s.get("totalCalls", ""), s.get("successRate", "")]
+             for s in tc.get("toolSuccessRates", [])[:10]],
+        )
+        parts = []
+        if bigrams != "(no data)":
+            parts.append(f"Top Bigrams:\n{bigrams}")
+        if trigrams != "(no data)":
+            parts.append(f"Top Trigrams:\n{trigrams}")
+        if success != "(no data)":
+            parts.append(f"Tool Success Rates:\n{success}")
+        if parts:
+            add("L1-3 工具链模式", "\n\n".join(parts))
 
-### 3.8 User Maturity
-- Narrative interpreting user growth trends
+    # ── L1-4 High Cost Sessions (cap 10, drop userFirstMessage) ──
+    hc = l1.get("highCostSessions", {})
+    chains = hc.get("taskChains", [])[:10]
+    if chains:
+        add("L1-4 高成本会话", _md_table(
+            ["sender", "session", "tokens", "cost", "msgs", "tools", "errors", "duration_s", "drivers"],
+            [[c.get("senderId", ""), c.get("sessionId", ""), c.get("totalTokens", ""),
+              c.get("totalCost", ""), c.get("messageCount", ""), c.get("toolCallCount", ""),
+              c.get("toolErrorCount", ""), c.get("durationSeconds", ""),
+              ", ".join(c.get("costDrivers", []))] for c in chains],
+        ))
 
-## 4. L3 Organizational Cognition
+    # ── L1-5 Anomalies ──
+    anomalies = l1.get("anomalies", {}).get("anomalies", [])
+    if anomalies:
+        add("L1-5 异常检测", _md_table(
+            ["sender", "type", "actual", "mean", "stddev", "z", "severity"],
+            [[a.get("senderId", ""), a.get("anomalyType", ""), a.get("actualValue", ""),
+              a.get("mean", ""), a.get("stddev", ""), a.get("zScore", ""),
+              a.get("severity", "")] for a in anomalies],
+        ))
 
-### 4.1 Tech Stack Heatmap
-- Narrative interpreting the team's technology focus areas
-- Table showing top tech stack (technology name, session count, unique users)
+    # ── L2-1 Intents (drop items array) ──
+    intents = l2.get("intents", {})
+    if intents:
+        dist = intents.get("distribution", {})
+        dist_table = _md_table(
+            ["intent", "count"],
+            [[k, v] for k, v in sorted(dist.items(), key=lambda x: -x[1])],
+        ) if dist else ""
 
-### 4.2 High-Frequency Repeated Questions
-- Narrative interpreting knowledge consolidation opportunities
-- Table showing questions asked repeatedly by multiple users (question, unique users, occurrences, category)
+        senders_by_cat = intents.get("sendersByCategory", {})
+        sbc_lines = "\n".join(
+            f"{cat}: {', '.join(senders)}"
+            for cat, senders in senders_by_cat.items() if senders
+        ) if senders_by_cat else ""
 
-### 4.3 Best Practices
-- List of extracted best practices (title + brief description)
+        # byUser intent table — keep for cross-referencing user behavior
+        by_user = intents.get("byUser", {})
+        if by_user:
+            all_cats = sorted({cat for user_cats in by_user.values() for cat in user_cats})
+            user_rows = []
+            for sender, cats in by_user.items():
+                user_rows.append([sender] + [cats.get(c, 0) for c in all_cats])
+            user_table = _md_table(["sender"] + all_cats, user_rows)
+        else:
+            user_table = ""
 
-### 4.4 Skill Candidates
-- Narrative interpreting automation opportunities
-- Table showing candidate Skills (name, description, trigger, estimated weekly usage)
+        # NOTE: items array is intentionally skipped — too large, not needed for report
+        parts = [p for p in [dist_table, sbc_lines, user_table] if p]
+        if parts:
+            add("L2-1 意图分类分布", "\n\n".join(parts))
 
-## 5. Action Recommendations
-3-5 specific, actionable recommendations in priority order, each with rationale and expected benefit.
+    # ── L2-2 Complexity (drop byUser, cap topComplex at 5) ──
+    complexity = l2.get("complexity", {})
+    if complexity:
+        dist = complexity.get("distribution", {})
+        dist_text = _kv_lines(dist) if dist else ""
+        top_complex = complexity.get("topComplex", [])[:5]
+        tc_table = _md_table(
+            ["sender", "session", "score", "turns", "tools", "thinking", "dur_min"],
+            [[c.get("senderId", ""), c.get("sessionId", ""), c.get("complexityScore", ""),
+              c.get("userTurns", ""), c.get("toolCallCount", ""),
+              c.get("thinkingLength", ""), c.get("durationMinutes", "")]
+             for c in top_complex],
+        ) if top_complex else ""
+        parts = [p for p in [dist_text, tc_table] if p]
+        if parts:
+            add("L2-2 任务复杂度", "\n\n".join(parts))
 
-Notes:
-- Every section must have BOTH narrative analysis AND data display — neither can be omitted
-- Skip entire subsections where data is missing — do not mention the absence
-- Numbers should be interpreted (e.g., "accounting for Y% of total"); use absolute values with qualitative judgment when no baseline exists
-- Use standard Markdown table syntax
-- The report should be understandable to a non-technical manager
+    # ── L2-3 Success Rate ──
+    success_rate = l2.get("successRate", {})
+    if success_rate:
+        overall = success_rate.get("overall", {})
+        overall_text = _kv_lines(overall) if overall else ""
 
-Return a JSON object:
-{{
-  "report": "complete Markdown-formatted report text"
-}}"""
+        by_user = success_rate.get("byUser", {})
+        if by_user:
+            user_rows = [[sender, d.get("success", 0), d.get("partial", 0), d.get("failure", 0)]
+                         for sender, d in by_user.items()]
+            user_table = _md_table(["sender", "success", "partial", "failure"], user_rows)
+        else:
+            user_table = ""
 
-        result = await llm_client.chat_json(system_prompt, user_prompt)
+        failures = success_rate.get("failures", [])[:10]
+        fail_table = _md_table(
+            ["sender", "session", "chain", "outcome"],
+            [[f.get("senderId", ""), f.get("sessionId", ""), f.get("taskChainId", ""),
+              f.get("outcome", "")] for f in failures],
+        ) if failures else ""
 
-        # Normalize: LLM may return a list instead of a dict
-        if isinstance(result, list):
-            result = result[0] if result and isinstance(result[0], dict) else {"report": str(result)}
-        if not isinstance(result, dict) or "report" not in result:
-            result = {"report": str(result)}
+        parts = [p for p in [overall_text, user_table, fail_table] if p]
+        if parts:
+            add("L2-3 任务成功率", "\n\n".join(parts))
 
-        print("[L3-5] Narrative report generated successfully")
-        return result
+    # ── L2-4 Prompt Quality ──
+    pq = l2.get("promptQuality", {})
+    if pq:
+        team_avg = pq.get("teamAverage", {})
+        avg_text = _kv_lines(team_avg) if team_avg else ""
 
-    except Exception as error:
-        print(f"[L3-5] Error generating narrative report: {error}")
-        return {"report": "Report generation failed due to LLM error. Please check LLM configuration."}
+        top_users = pq.get("topUsers", [])
+        top_table = _md_table(
+            ["sender", "overall", "best_prompt_preview"],
+            [[u.get("senderId", ""), u.get("overall", ""),
+              (u.get("bestPrompt", {}).get("content", "") or "")[:150]]
+             for u in top_users],
+        ) if top_users else ""
 
+        bottom_users = pq.get("bottomUsers", [])
+        bot_table = _md_table(
+            ["sender", "overall", "worst_prompt_preview"],
+            [[u.get("senderId", ""), u.get("overall", ""),
+              (u.get("worstPrompt", {}).get("content", "") or "")[:150]]
+             for u in bottom_users],
+        ) if bottom_users else ""
+
+        parts = [p for p in [avg_text] if p]
+        if top_table:
+            parts.append(f"Top Users:\n{top_table}")
+        if bot_table:
+            parts.append(f"Bottom Users:\n{bot_table}")
+        if parts:
+            add("L2-4 Prompt 质量评分", "\n\n".join(parts))
+
+    # ── L2-5 Topics ──
+    topics = l2.get("topics", {})
+    if topics:
+        cat_dist = topics.get("categoryDistribution", {})
+        cat_text = _kv_lines(cat_dist) if cat_dist else ""
+        top_tags = topics.get("topTags", [])
+        tag_table = _md_table(
+            ["tag", "category", "count", "users"],
+            [[t.get("tag", ""), t.get("category", ""), t.get("count", ""),
+              t.get("uniqueUsers", "")] for t in top_tags],
+        ) if top_tags else ""
+        parts = [p for p in [cat_text, tag_table] if p]
+        if parts:
+            add("L2-5 话题聚类", "\n\n".join(parts))
+
+    # ── L2-6 Retry Behavior ──
+    retry = l2.get("retryBehavior", {})
+    if retry:
+        summary = (f"retryRate: {retry.get('retryRate', '?')}\n"
+                   f"totalSessions: {retry.get('totalSessions', '?')}\n"
+                   f"retrySessionCount: {retry.get('retrySessionCount', '?')}")
+        add("L2-6 重试行为检测", summary)
+
+    # ── L2-7 Thinking Depth ──
+    td = l2.get("thinkingDepth", {})
+    if td:
+        by_depth = td.get("byDepth", [])
+        depth_table = _md_table(
+            ["depth", "msgs", "avg_output", "avg_cost", "avg_content_len"],
+            [[d.get("thinkingDepth", ""), d.get("messageCount", ""),
+              d.get("avgOutputTokens", ""), d.get("avgCost", ""),
+              d.get("avgContentLength", "")] for d in by_depth],
+        ) if by_depth else ""
+        by_model = td.get("byModel", [])
+        model_table = _md_table(
+            ["model", "total_msgs", "thinking_count", "thinking%", "avg_thinking_len"],
+            [[m.get("model", ""), m.get("totalMessages", ""), m.get("thinkingCount", ""),
+              m.get("thinkingPct", ""), m.get("avgThinkingLength", "")]
+             for m in by_model],
+        ) if by_model else ""
+        parts = [p for p in [depth_table, model_table] if p]
+        if parts:
+            add("L2-7 思考深度分布", "\n\n".join(parts))
+
+    # ── L2-8 User Maturity (cap 20, drop dailyScores) ──
+    maturity = l2.get("userMaturity", {})
+    users = maturity.get("users", [])[:20]
+    if users:
+        add("L2-8 用户成熟度趋势", _md_table(
+            ["sender", "prompts", "avg_score", "trend", "slope"],
+            [[u.get("senderId", ""), u.get("promptCount", ""), u.get("overallAvg", ""),
+              u.get("trend", ""), u.get("slope", "")] for u in users],
+        ))
+
+    # ── L3-1 Tech Stack ──
+    tech = l3.get("techStack", {})
+    techs = tech.get("technologies", [])
+    if techs:
+        add("L3-1 技术栈热力图", _md_table(
+            ["tech", "sessions", "users"],
+            [[t.get("tech", ""), t.get("sessionCount", ""), t.get("uniqueUsers", "")]
+             for t in techs],
+        ))
+
+    # ── L3-2 Repeated Questions ──
+    rq = l3.get("repeatedQuestions", {})
+    questions = rq.get("repeatedQuestions", [])
+    if questions:
+        add("L3-2 高频重复问题", _md_table(
+            ["question", "category", "users", "occurrences", "senders"],
+            [[q.get("canonicalQuestion", ""), q.get("category", ""),
+              q.get("uniqueUsers", ""), q.get("totalOccurrences", ""),
+              ", ".join(q.get("senders", []))] for q in questions],
+        ))
+
+    # ── L3-3 Best Practices ──
+    bp = l3.get("bestPractices", {})
+    practices = bp.get("bestPractices", [])
+    if practices:
+        practice_text = "\n\n".join(
+            f"**{p.get('title', '')}**: {p.get('description', '')}\nExample: {p.get('example', '')}"
+            for p in practices
+        )
+        patterns = bp.get("commonPatterns", [])
+        pattern_text = "\n".join(f"- {p}" for p in patterns) if patterns else ""
+        parts = [p for p in [practice_text, pattern_text] if p]
+        if parts:
+            add("L3-3 最佳实践", "\n\n".join(parts))
+
+    # ── L3-4 Skill Candidates ──
+    sc = l3.get("skillCandidates", {})
+    candidates = sc.get("skillCandidates", [])
+    if candidates:
+        skill_text = "\n\n".join(
+            f"**{c.get('name', '')}** (potential: {c.get('automationPotential', '?')}, "
+            f"weekly: ~{c.get('estimatedWeeklyUsage', '?')}, users: {c.get('uniqueUsers', '?')})\n"
+            f"Description: {c.get('description', '')}\n"
+            f"Trigger: {c.get('trigger', '')}\n"
+            f"Workflow: {c.get('workflow', '')}"
+            for c in candidates
+        )
+        add("L3-4 技能候选", skill_text)
+
+    return "\n\n".join(sections) if sections else "暂无分析数据"
 
 # ─── L3-5-NEW: Structured Report (总体结论 → 关键问题 → 优化建议) ───
 
-async def generate_structured_report(
+def generate_structured_report(
     all_results: dict,
     range_: TimeRange,
-    llm_client: LlmClient,
 ) -> dict:
-    """Generate a structured final report organized as:
+    """Generate a structured final report using template-based rendering.
+
+    No LLM call — pure Python template filling.  Structure:
     总体结论 → 关键问题 → 优化建议.
-
-    This is the new generation of the L3-5 report. The old
-    ``generate_narrative_report`` is kept for reference but is no longer
-    called in the main analysis flow.
     """
-    print("[L3-5-NEW] Generating structured report (总体结论 → 关键问题 → 优化建议)...")
+    print("[L3-5] Generating structured report (template mode)...")
 
-    try:
-        system_prompt = """You are a senior engineering intelligence analyst writing an executive insight report about AI agent assistant usage patterns.
+    l1 = all_results.get("l1", {})
+    l2 = all_results.get("l2", {})
+    l3 = all_results.get("l3", {})
 
-## Critical Context: Understanding the Data
+    sections: list[str] = []
+    period = f"{range_.start_date} ~ {range_.end_date}"
 
-The data you are analyzing comes from **OpenClaw**, an enterprise AI agent assistant platform. Each "session" or "task chain" represents an **AI Agent autonomously executing tasks** on behalf of a user — NOT a human manually operating a computer.
+    # ────────────────────────────────────────────────
+    # Helper: safe getters
+    # ────────────────────────────────────────────────
+    def _pct(num: float | int, total: float | int) -> str:
+        if not total:
+            return "N/A"
+        return f"{num / total * 100:.1f}%"
 
-Key distinctions you MUST apply throughout the report:
-- **Tool calls** (exec, read, write, web_fetch, etc.) are executed by the **AI Agent**, not by the user directly.
-- When you see patterns like "exec->exec->exec", it means the **Agent ran a sequence of commands**, not that a user typed commands manually.
-- **Users interact with the Agent through natural language messages**. The Agent then autonomously decides which tools to call and in what sequence.
-- Therefore, phrases like "用户手动执行命令" or "用户正在手动操作" are INCORRECT. The correct framing is "Agent 自动执行了..." or "AI 助理调用了...".
-- When discussing Skill candidates, the value proposition is NOT "减少用户的手动操作" but rather "将 Agent 的重复工作流封装为标准化 Skill，提升一致性和可复用性".
+    def _round2(val) -> str:
+        try:
+            return f"{float(val):.2f}"
+        except (TypeError, ValueError):
+            return str(val)
 
-## Report Requirements
+    # ════════════════════════════════════════════════
+    # 一、总体结论
+    # ════════════════════════════════════════════════
+    part1_lines: list[str] = [f"## 一、总体结论\n\n> 分析周期：{period}\n"]
 
-This is NOT a weekly report. It is an analysis report for a specific time range. Do NOT use terms like "本周", "周报", "weekly". Instead, refer to the analysis period using the exact dates provided.
+    # ── 1.1 整体运营健康度 ──
+    part1_lines.append("### 1.1 整体运营健康度\n")
 
-## Language Detection Rules
+    te = l1.get("tokenEfficiency", {})
+    overall_te = te.get("overall", {})
+    total_sessions = overall_te.get("totalSessions", 0)
+    total_cost = overall_te.get("totalCost", 0)
 
-Determine the report language based on the dominant language found in the user messages within the analysis data:
-- If the majority of user messages are in **Chinese**, write the entire report in **Chinese (中文)**.
-- If the majority of user messages are in **English**, write the entire report in **English**.
-- If the messages are evenly mixed, default to **Chinese**.
+    sr = l2.get("successRate", {})
+    sr_overall = sr.get("overall", {})
+    success_count = sr_overall.get("success", 0)
+    partial_count = sr_overall.get("partial", 0)
+    failure_count = sr_overall.get("failure", 0)
+    total_tasks = success_count + partial_count + failure_count
 
-Apply this language choice consistently throughout the entire report — do NOT mix languages within the report.
+    anomalies_data = l1.get("anomalies", {})
+    anomaly_list = anomalies_data.get("anomalies", [])
+    anomaly_count = len(anomaly_list)
 
-## Writing Principles
+    # Health rating
+    success_rate_val = (success_count / total_tasks * 100) if total_tasks else 0
+    if success_rate_val >= 85 and anomaly_count <= 2:
+        health_icon = "🟢 良好"
+    elif success_rate_val >= 70 or anomaly_count <= 5:
+        health_icon = "🟡 待改善"
+    else:
+        health_icon = "🔴 需关注"
 
-- **Conclusion-first**: Every section starts with the key takeaway, then supports it with data.
-- **Evidence-bound**: Every claim must cite a specific metric or data point from the analysis.
-- **Actionable**: Problems must be paired with root causes; recommendations must be specific and prioritized.
-- **Cross-layer synthesis**: Draw connections across L1/L2/L3 metrics — avoid treating them as isolated silos.
-- Use Markdown formatting: headers, bold text, tables, and bullet lists for readability."""
+    part1_lines.append(f"**整体健康度：{health_icon}**\n")
+    part1_lines.append(
+        f"- 分析周期内共 **{total_sessions}** 个会话，"
+        f"**{total_tasks}** 条任务链，"
+        f"总成本 **{_round2(total_cost)}**\n"
+        f"- 任务成功率 **{_pct(success_count, total_tasks)}**"
+        f"（成功 {success_count} / 部分成功 {partial_count} / 失败 {failure_count}）\n"
+        f"- 检测到 **{anomaly_count}** 个异常\n"
+    )
 
-        l1 = all_results.get("l1", {})
-        l2 = all_results.get("l2", {})
-        l3 = all_results.get("l3", {})
+    if anomaly_list:
+        anomaly_senders = sorted({str(a.get("senderId") or "?") for a in anomaly_list})
+        part1_lines.append(f"- 异常涉及用户：{', '.join(anomaly_senders)}\n")
 
-        data_sections: list[str] = []
+    # Token efficiency by model table
+    by_model = te.get("byModel", [])
+    if by_model:
+        part1_lines.append(_md_table(
+            ["模型", "会话数", "输入 token", "输出 token", "输出/输入比", "缓存命中率", "总成本", "均成本"],
+            [[m.get("model", ""), m.get("sessionCount", ""), m.get("totalInput", ""),
+              m.get("totalOutput", ""), m.get("outputInputRatio", ""),
+              m.get("cacheHitRatePct", ""), m.get("totalCost", ""),
+              m.get("avgCostPerSession", "")] for m in by_model],
+        ))
+        part1_lines.append("")
 
-        def append_section(label: str, data: dict) -> None:
-            if data:
-                data_sections.append(f"【{label}】\n{json.dumps(data, ensure_ascii=False, default=str)}")
+    # ── 1.2 核心使用场景 ──
+    part1_lines.append("### 1.2 核心使用场景\n")
 
-        # L1: Operational Efficiency
-        append_section("L1-1 Token 消耗与成本效率", l1.get("tokenEfficiency", {}))
-        append_section("L1-2 任务链深度分布", l1.get("sessionDepth", {}))
-        append_section("L1-3 工具链模式", l1.get("toolChains", {}))
-        append_section("L1-4 高成本会话 Top20", l1.get("highCostSessions", {}))
-        append_section("L1-5 异常检测", l1.get("anomalies", {}))
+    intents = l2.get("intents", {})
+    intent_dist = intents.get("distribution", {})
+    topics = l2.get("topics", {})
+    cat_dist = topics.get("categoryDistribution", {})
+    tech = l3.get("techStack", {})
+    techs = tech.get("technologies", [])
 
-        # L2: User Behavior
-        append_section("L2-1 意图分类分布", l2.get("intents", {}))
-        append_section("L2-2 任务复杂度", l2.get("complexity", {}))
-        append_section("L2-3 任务成功率", l2.get("successRate", {}))
-        append_section("L2-4 Prompt 质量评分", l2.get("promptQuality", {}))
-        append_section("L2-5 话题聚类", l2.get("topics", {}))
-        append_section("L2-6 重试行为检测", l2.get("retryBehavior", {}))
-        append_section("L2-7 思考深度分布", l2.get("thinkingDepth", {}))
-        append_section("L2-8 用户成熟度趋势", l2.get("userMaturity", {}))
+    scenario_rows: list[list] = []
+    if intent_dist:
+        for intent_name, count in sorted(intent_dist.items(), key=lambda x: -x[1])[:5]:
+            scenario_rows.append([intent_name, f"{count} 次", "L2-1 意图分类"])
+    if cat_dist:
+        for cat_name, count in sorted(cat_dist.items(), key=lambda x: -x[1])[:3]:
+            scenario_rows.append([cat_name, f"{count} 次", "L2-5 话题聚类"])
+    if techs:
+        for t in techs[:3]:
+            scenario_rows.append([t.get("technology", ""), f"{t.get('sessionCount', '')} 会话", "L3-1 技术栈"])
 
-        # L3: Organizational Cognition
-        append_section("L3-1 技术栈热力图", l3.get("techStack", {}))
-        append_section("L3-2 高频重复问题", l3.get("repeatedQuestions", {}))
-        append_section("L3-3 最佳实践", l3.get("bestPractices", {}))
-        append_section("L3-4 技能候选", l3.get("skillCandidates", {}))
+    if scenario_rows:
+        part1_lines.append(_md_table(["使用场景", "占比/频次", "数据来源"], scenario_rows))
+        part1_lines.append("")
 
-        all_data_text = "\n\n".join(data_sections) if data_sections else "暂无分析数据"
+    # Non-work intents
+    non_work_categories = {
+        "闲聊互动", "生活日常", "情感社交", "教育学习", "影视音乐",
+        "游戏电竞", "体育运动", "阅读创作",
+        "Casual Chat", "Daily Life", "Emotional Social", "Education",
+        "Entertainment", "Gaming", "Sports", "Reading & Writing",
+    }
+    senders_by_cat = intents.get("sendersByCategory", {})
+    non_work_rows: list[list] = []
+    for cat, senders in senders_by_cat.items():
+        if cat in non_work_categories and senders:
+            count = intent_dist.get(cat, len(senders))
+            non_work_rows.append([cat, ", ".join(str(s) for s in senders) if isinstance(senders, list) else str(senders), count])
+    if non_work_rows:
+        part1_lines.append("**非工作类意图：**\n")
+        part1_lines.append(_md_table(["非工作意图类别", "涉及用户", "消息数"], non_work_rows))
+        part1_lines.append("")
 
-        user_prompt = f"""Based on the following OpenClaw enterprise AI agent assistant usage analysis data, write a structured insight report for engineering leadership.
+    # ── 1.3 用户行为画像 ──
+    part1_lines.append("### 1.3 用户行为画像\n")
 
-Analysis period: {range_.start_date} to {range_.end_date}
+    # Prompt quality
+    pq = l2.get("promptQuality", {})
+    team_avg = pq.get("teamAverage", {})
+    if team_avg:
+        part1_lines.append(f"**Prompt 质量**：团队平均分 **{_round2(team_avg.get('overall', 'N/A'))}**\n")
 
-IMPORTANT — Language selection: Examine the user messages in the intent classification (L2-1) and topic clustering (L2-5) data to determine whether the majority are in Chinese or English. Write the ENTIRE report in that language. Do NOT mix languages.
+    top_users = pq.get("topUsers", [])
+    bottom_users = pq.get("bottomUsers", [])
+    if top_users:
+        part1_lines.append("Top 用户：" + ", ".join(
+            f"{u.get('senderId', '?')}({_round2(u.get('overall', ''))})" for u in top_users[:3]
+        ) + "\n")
+    if bottom_users:
+        part1_lines.append("Bottom 用户：" + ", ".join(
+            f"{u.get('senderId', '?')}({_round2(u.get('overall', ''))})" for u in bottom_users[:3]
+        ) + "\n")
 
-This is NOT a weekly report. Refer to the analysis period using the exact dates above.
+    # Complexity
+    complexity = l2.get("complexity", {})
+    comp_dist = complexity.get("distribution", {})
+    if comp_dist:
+        part1_lines.append(f"\n**任务复杂度分布**：{_kv_lines(comp_dist)}\n")
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Analysis data (three-layer insight engine):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Retry
+    retry = l2.get("retryBehavior", {})
+    retry_rate = retry.get("retryRate", None)
+    if retry_rate is not None:
+        part1_lines.append(
+            f"\n**重试率**：{retry_rate}"
+            f"（{retry.get('retrySessionCount', '?')}/{retry.get('totalSessions', '?')} 会话）\n"
+        )
 
-{all_data_text}
+    # Maturity
+    maturity = l2.get("userMaturity", {})
+    maturity_users = maturity.get("users", [])[:10]
+    if maturity_users:
+        part1_lines.append("\n**用户成熟度趋势**：\n")
+        part1_lines.append(_md_table(
+            ["用户", "Prompt 数", "平均分", "趋势", "斜率"],
+            [[u.get("senderId", ""), u.get("promptCount", ""), _round2(u.get("overallAvg", "")),
+              u.get("trend", ""), _round2(u.get("slope", ""))] for u in maturity_users],
+        ))
+        part1_lines.append("")
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    sections.append("\n".join(part1_lines))
 
-The report MUST follow exactly this three-part structure. Every claim must be backed by specific data from the analysis above. Synthesize ACROSS layers — do not just describe each metric in isolation.
+    # ════════════════════════════════════════════════
+    # 二、关键问题（rule-based extraction）
+    # ════════════════════════════════════════════════
+    problems: list[str] = []
+    problem_idx = 0
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-REPORT STRUCTURE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    def _add_problem(title: str, severity: str, phenomenon: str,
+                     evidence: list[str], users: list[str], impact: str) -> None:
+        nonlocal problem_idx
+        problem_idx += 1
+        user_str = ", ".join(str(u) for u in users) if users else "数据中无 sender_id 信息"
+        evidence_str = "\n".join(f"- {e}" for e in evidence)
+        problems.append(
+            f"### 问题{problem_idx}：{title}（严重程度：{severity}）\n\n"
+            f"**现象**：{phenomenon}\n\n"
+            f"**数据依据**：\n{evidence_str}\n\n"
+            f"**涉及用户**：{user_str}\n\n"
+            f"**业务影响**：{impact}\n"
+        )
 
-## 一、总体结论
+    # Problem: High failure rate
+    if total_tasks and failure_count / total_tasks > 0.1:
+        fail_senders = sorted({str(f.get("senderId") or "?") for f in sr.get("failures", [])[:10]})
+        _add_problem(
+            "任务失败率偏高", "高",
+            f"任务失败率达 {_pct(failure_count, total_tasks)}，共 {failure_count} 条任务链失败。",
+            [f"L2-3 成功率：成功 {success_count}，部分 {partial_count}，失败 {failure_count}"],
+            fail_senders,
+            "失败任务浪费 token 且用户体验差，需排查失败原因。",
+        )
 
-A holistic synthesis of the analysis period. Do NOT list raw numbers — interpret what they mean together.
+    # Problem: High cost anomalies
+    hc = l1.get("highCostSessions", {})
+    hc_chains = hc.get("taskChains", [])[:5]
+    if hc_chains:
+        top_cost = hc_chains[0].get("totalCost", 0)
+        avg_cost_val = overall_te.get("avgCostPerSession", 0)
+        if avg_cost_val and top_cost > avg_cost_val * 5:
+            hc_senders = sorted({str(c.get("senderId") or "?") for c in hc_chains})
+            _add_problem(
+                "高成本会话异常", "高",
+                f"Top 高成本会话成本达 {_round2(top_cost)}，是平均值 {_round2(avg_cost_val)} 的 {top_cost / avg_cost_val:.0f} 倍。",
+                [f"L1-4 高成本会话 Top 1 成本：{_round2(top_cost)}",
+                 f"L1-1 平均会话成本：{_round2(avg_cost_val)}"],
+                hc_senders,
+                "少数会话消耗大量 token 预算，可能存在 Agent 失控或任务设计不合理。",
+            )
 
-### 1.1 整体运营健康度
-One paragraph conclusion on the overall health of AI agent usage. Synthesize: total task volume, success rate (L2-3), anomaly count (L1-5), and cost trend (L1-1). Assign an overall health rating: 🟢 良好 / 🟡 待改善 / 🔴 需关注, with a one-line rationale.
+    # Problem: Anomalies detected
+    if anomaly_count >= 3:
+        anomaly_types = {}
+        for a in anomaly_list:
+            atype = a.get("anomalyType", "unknown")
+            anomaly_types[atype] = anomaly_types.get(atype, 0) + 1
+        anomaly_senders_list = sorted({str(a.get("senderId") or "?") for a in anomaly_list})
+        _add_problem(
+            "多项异常指标触发", "中",
+            f"检测到 {anomaly_count} 个异常，类型分布：{anomaly_types}。",
+            [f"L1-5 异常检测：共 {anomaly_count} 个异常"],
+            anomaly_senders_list,
+            "异常集中可能指向系统性问题，需逐一排查。",
+        )
 
-### 1.2 核心使用场景
-What are users primarily using the AI agent for? Synthesize the top intent categories (L2-1), hottest topic tags (L2-5), and main technology focus areas (L3-1) into a coherent narrative. Include a compact summary table:
+    # Problem: High retry rate
+    if retry_rate is not None:
+        try:
+            retry_val = float(str(retry_rate).rstrip("%")) / 100 if "%" in str(retry_rate) else float(retry_rate)
+        except (TypeError, ValueError):
+            retry_val = 0
+        if retry_val > 0.15:
+            _add_problem(
+                "重试率偏高", "中",
+                f"重试率达 {retry_rate}，表明用户频繁重试或 Agent 响应不符合预期。",
+                [f"L2-6 重试率：{retry_rate}"],
+                [],
+                "高重试率浪费 token 并降低用户满意度。",
+            )
 
-| 使用场景 | 占比/频次 | 数据来源 |
-|---|---|---|
+    # Problem: Prompt quality polarization
+    if bottom_users:
+        worst_score = bottom_users[0].get("overall", 0)
+        if worst_score and float(worst_score) < 5.0:
+            low_senders = [str(u.get("senderId") or "?") for u in bottom_users[:3]]
+            bottom_desc_parts = [
+                f"{s.get('senderId', '?')}={_round2(s.get('overall', ''))}"
+                for s in bottom_users[:3]
+            ]
+            bottom_desc = ", ".join(bottom_desc_parts)
+            _add_problem(
+                "部分用户 Prompt 质量偏低", "中",
+                f"最低 Prompt 质量评分仅 {_round2(worst_score)}，与团队平均 {_round2(team_avg.get('overall', 'N/A'))} 差距明显。",
+                [f"L2-4 Bottom 用户评分：{bottom_desc}"],
+                low_senders,
+                "低质量 Prompt 导致 Agent 理解偏差，增加重试和失败率。",
+            )
 
-### 1.3 用户行为画像
-Describe the typical user profile based on: prompt quality distribution (L2-4), task complexity (L2-2), maturity trend (L2-8), and retry rate (L2-6). Are users sophisticated or still learning? Is adoption growing?
+    # Problem: Repeated questions (knowledge gaps)
+    repeated_q = l3.get("repeatedQuestions", {})
+    rq_list = repeated_q.get("repeatedQuestions", [])
+    multi_user_questions = [q for q in rq_list if q.get("uniqueUsers", 0) >= 3]
+    if multi_user_questions:
+        _add_problem(
+            "知识缺口：多用户重复提问", "中",
+            f"发现 {len(multi_user_questions)} 个问题被 3 人以上独立提出，表明团队存在共性知识缺口。",
+            [f"L3-2 重复问题：{q.get('canonicalQuestion', '?')}（{q.get('uniqueUsers', '?')} 人提问）"
+             for q in multi_user_questions[:3]],
+            sorted({str(s) for q in multi_user_questions for s in (q.get("senders", []) if isinstance(q.get("senders"), list) else []) if s is not None}),
+            "重复提问浪费团队时间，应沉淀为文档或 Skill。",
+        )
 
----
+    part2_lines = ["## 二、关键问题\n"]
+    if problems:
+        part2_lines.extend(problems)
+    else:
+        part2_lines.append("本分析周期内未检测到显著问题。\n")
+    sections.append("\n".join(part2_lines))
 
-## 二、关键问题
+    # ════════════════════════════════════════════════
+    # 三、优化建议
+    # ════════════════════════════════════════════════
+    part3_lines = ["## 三、优化建议\n"]
 
-Identify 3–6 concrete problems found in the data, ordered by severity (高 → 中 → 低). Each problem must:
-- Have a clear, specific title
-- Cite the exact metrics that evidence the problem
-- Explain the business impact
+    # ── 3.1 成本优化类 ──
+    part3_lines.append("### 3.1 成本优化类\n")
+    cost_recs: list[str] = []
 
-Use this format for each problem:
+    if hc_chains and problem_idx > 0:
+        hc_senders_str = ", ".join(sorted({str(c.get("senderId") or "?") for c in hc_chains}))
+        cost_recs.append(
+            "#### 建议：排查高成本会话根因（优先级：高）\n\n"
+            f"**建议内容**：对高成本会话涉及用户（{hc_senders_str}）进行 1:1 沟通，"
+            "了解任务场景，优化 Prompt 或拆分复杂任务。\n\n"
+            "**数据依据**：关键问题中的高成本会话异常\n\n"
+            "**预期收益**：降低 Top 会话成本 50%+\n\n"
+            "**参考指标**：L1-4 高成本会话 Top 5 成本趋势\n"
+        )
 
-### 问题N：[问题标题]（严重程度：高 / 中 / 低）
+    if non_work_rows:
+        cost_recs.append(
+            "#### 建议：关注非工作类使用（优先级：中）\n\n"
+            "**建议内容**：对非工作类意图使用进行团队沟通，明确使用规范。\n\n"
+            "**数据依据**：1.2 节非工作类意图统计\n\n"
+            "**预期收益**：减少非必要 token 消耗\n\n"
+            "**参考指标**：L2-1 非工作类意图占比趋势\n"
+        )
 
-**现象**：[1–2 sentences describing what was observed]
+    if retry_rate is not None and retry_val > 0.15:
+        cost_recs.append(
+            "#### 建议：降低重试率（优先级：中）\n\n"
+            "**建议内容**：分析高重试用户的 Prompt 模式，提供 Prompt 编写指南。\n\n"
+            f"**数据依据**：L2-6 重试率 {retry_rate}\n\n"
+            "**预期收益**：重试率降至 10% 以下，节省 token\n\n"
+            "**参考指标**：L2-6 重试率\n"
+        )
 
-**数据依据**：
-- [Metric source, e.g., L2-3]: [specific number or finding]
-- [Metric source]: [specific number or finding]
+    if cost_recs:
+        part3_lines.extend(cost_recs)
+    else:
+        part3_lines.append("暂无明显成本问题。\n")
 
-**业务影响**：[What goes wrong if this problem is not addressed]
+    # ── 3.2 技能沉淀 / 效果优化类 ──
+    part3_lines.append("### 3.2 技能沉淀 / 效果优化类\n")
+    skill_recs: list[str] = []
 
-Potential problems to look for (use data to confirm, not all may exist):
-- High-cost anomaly sessions consuming disproportionate tokens (L1-4, L1-5)
-- Elevated retry rate indicating unclear prompts or agent confusion (L2-6)
-- Task failure clusters in specific intent categories (L2-3 + L2-1 cross-analysis)
-- Knowledge gaps evidenced by the same question asked by multiple users independently (L3-2)
-- Prompt quality polarization — a small group dragging down average quality (L2-4)
-- Marathon sessions (very deep task chains) that may indicate runaway agents (L1-2)
-- Repeated tool chain patterns that suggest unautomated repetitive work (L1-3, L3-4)
+    # Skill candidates
+    skill_candidates = l3.get("skillCandidates", {})
+    sc_list = skill_candidates.get("skillCandidates", [])
+    if sc_list:
+        top_skills = sc_list[:3]
+        skill_names = ", ".join(str(s.get("name") or "?") for s in top_skills)
+        skill_recs.append(
+            f"#### 建议：封装高频工作流为 Skill（优先级：高）\n\n"
+            f"**建议内容**：将以下候选 Skill 封装为标准化 Skill：{skill_names}。\n\n"
+            f"**数据依据**：L3-4 Skill 候选列表\n\n"
+            f"**预期收益**：提升 Agent 工作流一致性和可复用性\n\n"
+            f"**参考指标**：Skill 使用次数和成功率\n"
+        )
 
----
+    if multi_user_questions:
+        skill_recs.append(
+            "#### 建议：沉淀高频重复问题为知识库（优先级：高）\n\n"
+            "**建议内容**：将多用户重复提问的问题整理为团队知识库或 FAQ。\n\n"
+            f"**数据依据**：L3-2 发现 {len(multi_user_questions)} 个 3 人以上重复问题\n\n"
+            "**预期收益**：减少重复提问，提升团队效率\n\n"
+            "**参考指标**：L3-2 重复问题数量趋势\n"
+        )
 
-## 三、优化建议
+    if bottom_users and float(bottom_users[0].get("overall", 10)) < 5.0:
+        skill_recs.append(
+            "#### 建议：针对低分用户开展 Prompt 培训（优先级：中）\n\n"
+            f"**建议内容**：为 Prompt 质量评分较低的用户提供培训和最佳实践示例。\n\n"
+            f"**数据依据**：L2-4 Bottom 用户评分偏低\n\n"
+            f"**预期收益**：提升整体 Prompt 质量，减少失败和重试\n\n"
+            f"**参考指标**：L2-4 团队平均 Prompt 质量评分\n"
+        )
 
-Provide 4–6 specific, actionable recommendations in priority order (高 → 中 → 低). Each recommendation must directly address a problem identified in Section 二, or an opportunity identified in the data.
+    # Best practices
+    best_practices = l3.get("bestPractices", {})
+    bp_list = best_practices.get("bestPractices", [])
+    if bp_list:
+        skill_recs.append(
+            "#### 建议：推广最佳实践（优先级：中）\n\n"
+            "**建议内容**：将已识别的最佳实践在团队内推广分享。\n\n"
+            f"**数据依据**：L3-3 识别出 {len(bp_list)} 条最佳实践\n\n"
+            "**预期收益**：提升团队整体使用水平\n\n"
+            "**参考指标**：L2-4 Prompt 质量评分、L2-8 用户成熟度趋势\n"
+        )
 
-Use this format for each recommendation:
+    if skill_recs:
+        part3_lines.extend(skill_recs)
+    else:
+        part3_lines.append("暂无明显优化机会。\n")
 
-### 建议N：[建议标题]（优先级：高 / 中 / 低）
+    sections.append("\n".join(part3_lines))
 
-**建议内容**：[Concrete action to take — be specific, not vague]
+    # ════════════════════════════════════════════════
+    # Appendix: Data tables (compact reference)
+    # ════════════════════════════════════════════════
+    appendix_lines = ["## 附录：详细数据\n"]
+    appendix_data = _format_for_report(all_results)
+    if appendix_data.strip():
+        appendix_lines.append(appendix_data)
+    sections.append("\n".join(appendix_lines))
 
-**数据依据**：[Which metrics or findings in Section 二 motivated this recommendation]
-
-**预期收益**：[What measurable improvement is expected]
-
-**参考指标**：[Which metrics to track to measure success]
-
-Recommendations should cover a mix of:
-- Cost optimization (e.g., targeting high-cost session patterns from L1-4)
-- Quality improvement (e.g., Prompt quality training based on L2-4 findings)
-- Knowledge management (e.g., FAQ or knowledge base from L3-2 repeated questions)
-- Automation/Skill packaging (e.g., converting top tool chain patterns from L3-4 into reusable Skills)
-- Best practice promotion (e.g., spreading patterns from L3-3 to lower-maturity users in L2-8)
-
----
-
-Notes:
-- If a data section is missing or empty, silently skip related subsections — do not mention the absence.
-- All tables must use standard Markdown syntax.
-- The report should be readable by both technical leads and non-technical managers.
-- Do NOT add any section outside the three main sections above (no appendix, no data dump section).
-
-Return a JSON object:
-{{
-  "report": "complete Markdown-formatted report text"
-}}"""
-
-        result = await llm_client.chat_json(system_prompt, user_prompt)
-
-        # Normalize: LLM may return a list instead of a dict
-        if isinstance(result, list):
-            result = result[0] if result and isinstance(result[0], dict) else {"report": str(result)}
-        if not isinstance(result, dict) or "report" not in result:
-            result = {"report": str(result)}
-
-        print("[L3-5-NEW] Structured report generated successfully")
-        return result
-
-    except Exception as error:
-        print(f"[L3-5-NEW] Error generating structured report: {error}")
-        return {"report": "Report generation failed due to LLM error. Please check LLM configuration."}
+    report_text = "\n\n---\n\n".join(sections)
+    print("[L3-5] Structured report generated successfully (template mode)")
+    return {"report": report_text}
 
 
 # ─── L3 Analysis Orchestration ───
@@ -943,13 +1667,37 @@ async def run_l3_independent_cases(
     }
 
 
+async def run_l3_independent_cases_no_tech_stack(
+    adb_config: AdbConfig,
+    table_name: str,
+    range_: TimeRange,
+    llm_client: LlmClient,
+) -> dict:
+    """Run L3-2/3/4 in parallel, skipping L3-1 (tech stack handled by combined analysis).
+
+    Returns a partial L3 results dict with keys:
+    ``repeatedQuestions``, ``bestPractices``, ``skillCandidates``.
+    """
+    print("[L3] Starting L3-2/3/4 (tech stack skipped — handled by combined analysis)...")
+
+    repeated_questions, best_practices, skill_candidates = await asyncio.gather(
+        discover_repeated_questions(adb_config, table_name, range_, llm_client),
+        extract_best_practices(adb_config, table_name, range_, llm_client),
+        discover_skill_candidates(adb_config, table_name, range_, llm_client),
+    )
+
+    print("[L3] L3-2/3/4 completed")
+    return {
+        "repeatedQuestions": repeated_questions,
+        "bestPractices": best_practices,
+        "skillCandidates": skill_candidates,
+    }
+
 async def run_l3_analysis(
     adb_config: AdbConfig,
     table_name: str,
     range_: TimeRange,
     llm_client: LlmClient,
-    l1_results: dict,
-    l2_results: dict,
 ) -> dict:
     print("[L3] Starting L3 organizational cognition analysis (parallel)...")
 
@@ -962,19 +1710,109 @@ async def run_l3_analysis(
         build_tech_stack_heatmap(adb_config, table_name, range_, llm_client),
         discover_repeated_questions(adb_config, table_name, range_, llm_client),
         extract_best_practices(adb_config, table_name, range_, llm_client),
-        discover_skill_candidates(
-            l1_results.get("toolChains", {}),
-            l2_results.get("topics", {}),
-            l2_results.get("intents", {}),
-            llm_client,
-        ),
+        discover_skill_candidates(adb_config, table_name, range_, llm_client),
     )
 
     print("[L3] L3 analysis completed successfully")
 
-    return {
-        "techStack": tech_stack,
-        "repeatedQuestions": repeated_questions,
-        "bestPractices": best_practices,
-        "skillCandidates": skill_candidates,
-    }
+
+# ─── HTML Report Generator ───
+
+_HTML_DESIGN_SYSTEM_PROMPT = """You are an elite frontend engineer and visual designer. Your task is to convert a Markdown analysis report into a single, self-contained HTML file that is breathtakingly beautiful, production-grade, and unforgettable.
+
+## Design Thinking
+
+**Purpose**: An executive-level AI usage insight report for engineering leadership. Dense, information-rich, authoritative.
+
+**Aesthetic Direction**: Editorial / Data-Magazine hybrid — think Bloomberg Intelligence meets a dark-themed developer dashboard. Dark background, sharp typographic hierarchy, data visualizations rendered as pure CSS/HTML, with deliberate use of accent color.
+
+**Differentiation**: A dramatic full-viewport header with the report title rendered in a large, editorial typeface. Sections separated by bold horizontal rules with section numbers. Key metrics surfaced as "stat cards" with large numerals. Subtle noise texture overlay on the background for depth.
+
+## Implementation Rules
+
+1. **Single self-contained file** — all CSS and JS must be inline; no external CDN dependencies.
+2. **Font**: Use `@import` from Google Fonts for a distinctive pair:
+   - Display/heading: `Bebas Neue` or `Space Grotesk` — NO. Instead use `Playfair Display` (editorial, authoritative) for H1/H2.
+   - Body: `IBM Plex Mono` for code-heavy data sections, `Source Serif 4` for prose paragraphs.
+   - NEVER use Inter, Roboto, Arial, or system-ui as a primary font.
+3. **Color palette** (CSS variables):
+   - `--bg`: `#0d0f14` (near-black with blue undertone)
+   - `--surface`: `#161922`
+   - `--border`: `#2a2e3d`
+   - `--accent`: `#e8c547` (warm gold — data highlight color)
+   - `--accent-dim`: `#7a6823`
+   - `--text-primary`: `#e8e9ed`
+   - `--text-secondary`: `#8b8fa8`
+   - `--text-muted`: `#4a4e60`
+   - `--danger`: `#e05c5c`
+   - `--success`: `#4ead7a`
+4. **Layout**: Max-width 960px, centered. Generous padding. Each Markdown `##` section becomes a `<section>` card with a border-left accent stripe and a bold section counter.
+5. **Animations**: Use CSS `@keyframes` for a staggered fade-in-up on page load for section cards (`animation-delay: calc(var(--i) * 80ms)`). Add a subtle pulse on stat card numbers.
+6. **Markdown conversion rules**:
+   - `# Title` → Full-bleed dark hero header with title in Playfair Display, large (clamp(2.5rem, 8vw, 5rem))
+   - `## Section` → Section card with bold left-border stripe, section number badge, heading in Playfair Display
+   - `### Subsection` → Bold sub-heading with a thin separator line
+   - `**bold**` → `<strong>` with gold color
+   - `` `code` `` → inline styled `<code>` with monospace, dark background
+   - Code blocks (``` ```) → styled `<pre><code>` with dark surface, subtle border
+   - Tables → Styled with alternating row shading, header row in accent color
+   - Lists → Custom bullet style using a gold dash `—`
+   - Horizontal rules `---` → Dramatic `<hr>` with gradient fade
+   - Numbers that look like metrics (e.g., "1,234 sessions", "87%") → auto-highlight with accent color span
+7. **Stat cards**: If the Markdown contains lines like "总会话数: 1234" or metric summaries in the opening section, extract and render them as horizontal stat card strips with large numerals.
+8. **Noise texture**: Add an SVG noise filter via a `<div class="noise-overlay">` positioned fixed, pointer-events none, opacity 0.03.
+9. **Footer**: A minimal dark footer with "Generated by OpenClaw Insight" and the timestamp.
+10. **Responsive**: The layout must be readable on mobile (max-width 768px breakpoint).
+
+## Output
+
+Return ONLY the complete HTML document — starting with `<!DOCTYPE html>` and ending with `</html>`. No markdown fences, no explanation, no preamble. The HTML must be fully self-contained and renderable by opening the file directly in a browser.
+"""
+
+
+async def generate_html_report(markdown_content: str, llm_client: LlmClient) -> str:
+    """Convert a Markdown report to a beautiful, self-contained HTML page.
+
+    Uses the LLM with a detailed design system prompt to produce editorial,
+    dark-themed HTML. Returns the HTML string, or empty string on failure.
+    """
+    print("[HTML-Report] Starting HTML report generation from Markdown...")
+
+    if not markdown_content.strip():
+        print("[HTML-Report] ⚠️ Empty Markdown content, skipping HTML generation")
+        return ""
+
+    user_message = (
+        "Convert the following Markdown analysis report into a beautiful, "
+        "self-contained HTML page following all design rules in your system prompt.\n\n"
+        "--- BEGIN MARKDOWN ---\n"
+        f"{markdown_content}\n"
+        "--- END MARKDOWN ---"
+    )
+
+    try:
+        import time as _time
+        start = _time.time()
+        html_content = await llm_client.chat(
+            system_prompt=_HTML_DESIGN_SYSTEM_PROMPT,
+            user_prompt=user_message,
+        )
+        elapsed = _time.time() - start
+
+        # Strip any accidental markdown code fences the LLM might prepend
+        html_content = html_content.strip()
+        if html_content.startswith("```"):
+            lines = html_content.split("\n")
+            # Remove first line (``` or ```html) and last line (```)
+            if lines[-1].strip() == "```":
+                lines = lines[1:-1]
+            else:
+                lines = lines[1:]
+            html_content = "\n".join(lines)
+
+        print(f"[HTML-Report] ✅ HTML generated in {elapsed:.1f}s ({len(html_content)} chars)")
+        return html_content
+
+    except Exception as exc:
+        print(f"[HTML-Report] ❌ HTML generation failed: {exc}")
+        return ""

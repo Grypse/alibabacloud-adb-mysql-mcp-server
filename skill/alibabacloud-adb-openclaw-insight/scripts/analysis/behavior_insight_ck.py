@@ -11,7 +11,7 @@ from typing import Any
 
 from scripts.config_ck import CkConfig
 from scripts.db_ck import execute_query_async
-from scripts.llm_client import LlmClient
+from scripts.llm_client import LlmClient, count_tokens, count_tokens_single, _MAX_BATCH_TOKENS as MAX_BATCH_TOKENS
 from scripts.types import TimeRange, time_range_to_sql_params
 
 
@@ -139,11 +139,10 @@ async def classify_intents(
             print("[L2-1] No valid user messages after metadata extraction")
             return {"distribution": {}, "byUser": {}, "items": []}
 
-        messages = [row["message_text"] for row in rows]
+        messages = [row["message_text"][:500] for row in rows]
 
-        total_chars = sum(len(msg) for msg in messages)
-        estimated_tokens = int(total_chars * 1.5)
-        max_single_batch_tokens = 128_000
+        estimated_tokens = count_tokens(messages)
+        max_single_batch_tokens = MAX_BATCH_TOKENS
 
         if estimated_tokens < max_single_batch_tokens:
             batch_size = len(messages)
@@ -156,7 +155,7 @@ async def classify_intents(
             numbered = "\n\n".join(f"{start_index + i + 1}. {msg}" for i, msg in enumerate(batch))
             return f"请对以下用户消息进行意图分类：\n\n{numbered}\n\n返回 JSON 数组，每个元素包含 category 和 confidence。"
 
-        print(f"[L2-1] Queried {len(rows)} user messages ({total_chars} chars), sending to LLM for classification...")
+        print(f"[L2-1] Queried {len(rows)} user messages ({estimated_tokens} tokens), sending to LLM for classification...")
         results = await llm_client.batch_classify(
             messages, _INTENT_SYSTEM_PROMPT, batch_size, build_user_prompt, label="L2-1:intent"
         )
@@ -500,14 +499,12 @@ _SCORE_USER_PROMPT_TEMPLATE = (
     "few_shot_examples, iteration_signals, specificity for each prompt."
 )
 
-_MAX_BATCH_TOKENS = 128_000
-_TOKEN_CHARS_RATIO = 2.5
 
 
 def _make_token_bounded_batches(
     user_ids: list[str],
     user_tokens: dict[str, int],
-    max_tokens: int = _MAX_BATCH_TOKENS,
+    max_tokens: int = MAX_BATCH_TOKENS,
 ) -> list[list[str]]:
     """Greedily pack users into batches that each stay under max_tokens.
 
@@ -568,7 +565,7 @@ async def _score_prompts_per_user(
         msgs = [r["user_prompt"][:msg_truncate] for _, r in indexed_rows]
         ctx = "\n\n---\n\n".join(f"[{i + 1}]\n{msg}" for i, msg in enumerate(msgs))
         user_context[uid] = ctx
-        user_tokens[uid] = int(len(ctx) * _TOKEN_CHARS_RATIO)
+        user_tokens[uid] = count_tokens_single(ctx)
 
     batches = _make_token_bounded_batches(user_ids, user_tokens)
     total_batches = len(batches)
@@ -662,15 +659,14 @@ async def score_prompt_quality(
             print("[L2-4] No valid user prompts after metadata extraction")
             return _empty_prompt_quality_result()
 
-        messages = [row["user_prompt"] for row in rows]
+        messages = [row["user_prompt"][:500] for row in rows]
         num_users = len({row["sender_id"] for row in rows})
 
-        total_chars = sum(len(msg) for msg in messages)
-        estimated_tokens = int(total_chars * 2.5)
+        estimated_tokens = count_tokens(messages)
 
-        if estimated_tokens < 128_000:
+        if estimated_tokens < MAX_BATCH_TOKENS:
             # Small dataset: single flat batch (all messages together)
-            print(f"[L2-4] {len(rows)} msgs / {num_users} users, ~{estimated_tokens} tokens (< 128K) → single batch")
+            print(f"[L2-4] {len(rows)} msgs / {num_users} users, {estimated_tokens} tokens (< 128K) → single batch")
 
             def _build_flat_prompt(batch: list[str], start_index: int) -> str:
                 numbered = "\n\n---\n\n".join(f"[{start_index + i + 1}]\n{msg}" for i, msg in enumerate(batch))
@@ -905,11 +901,10 @@ async def cluster_topics(
             print("[L2-5] No valid user messages after metadata extraction")
             return {"categoryDistribution": {}, "topTags": [], "byUser": {}}
 
-        messages = [row["user_message"] for row in rows]
+        messages = [row["user_message"][:500] for row in rows]
 
-        total_chars = sum(len(msg) for msg in messages)
-        estimated_tokens = int(total_chars * 1.5)
-        max_single_batch_tokens = 128_000
+        estimated_tokens = count_tokens(messages)
+        max_single_batch_tokens = MAX_BATCH_TOKENS
 
         if estimated_tokens < max_single_batch_tokens:
             batch_size = len(messages)
@@ -1068,7 +1063,7 @@ def _build_top_tags(tag_counts: dict[str, dict]) -> list[dict]:
 
 async def _combined_per_message(rows: list[dict], llm_client: LlmClient) -> dict:
     """Small dataset path: one LLM batch returning intent+topic+tech per message."""
-    messages = [r["msg_text"] for r in rows]
+    messages = [r["msg_text"][:500] for r in rows]
     print(f"[Combined:per-msg] {len(messages)} messages → single batch")
 
     def build_user_prompt(batch: list[str], start_index: int) -> str:
@@ -1190,7 +1185,7 @@ async def _combined_per_user(rows: list[dict], llm_client: LlmClient) -> dict:
         snippets = [f"[{j+1}] {r['msg_text'][:500]}" for j, r in enumerate(user_rows[uid])]
         ctx = f"user_id: {uid}\n" + "\n".join(snippets)
         user_context[uid] = ctx
-        user_tokens[uid] = int(len(ctx) * _TOKEN_CHARS_RATIO)
+        user_tokens[uid] = count_tokens_single(ctx)
 
     total_tokens = sum(user_tokens.values())
     batches = _make_token_bounded_batches(user_ids, user_tokens)
@@ -1357,12 +1352,11 @@ async def classify_messages_combined(
             print("[Combined] No valid messages after metadata extraction")
             return _empty
 
-        total_chars = sum(len(r["msg_text"]) for r in rows)
-        estimated_tokens = int(total_chars * 2.5)
+        estimated_tokens = count_tokens([r["msg_text"] for r in rows])
         print(f"[Combined] {len(rows)} messages from {len({r['sender_id'] for r in rows})} users, "
-              f"~{estimated_tokens} estimated tokens")
+              f"{estimated_tokens} estimated tokens")
 
-        if estimated_tokens < 128_000:
+        if estimated_tokens < MAX_BATCH_TOKENS:
             return await _combined_per_message(rows, llm_client)
         else:
             return await _combined_per_user(rows, llm_client)
@@ -1587,15 +1581,14 @@ async def track_user_maturity(
             print("[L2-8] No valid user prompts after metadata extraction")
             return {"users": []}
 
-        messages = [row["user_prompt"] for row in rows]
+        messages = [row["user_prompt"][:500] for row in rows]
         num_users = len({row["sender_id"] for row in rows})
 
-        total_chars = sum(len(msg) for msg in messages)
-        estimated_tokens = int(total_chars * 2.5)
+        estimated_tokens = count_tokens(messages)
 
-        if estimated_tokens < 128_000:
+        if estimated_tokens < MAX_BATCH_TOKENS:
             # Small dataset: single flat batch (all messages together)
-            print(f"[L2-8] {len(rows)} msgs / {num_users} users, ~{estimated_tokens} tokens (< 128K) → single batch")
+            print(f"[L2-8] {len(rows)} msgs / {num_users} users, {estimated_tokens} tokens (< 128K) → single batch")
 
             def _build_flat_prompt_l28(batch: list[str], start_index: int) -> str:
                 numbered = "\n\n---\n\n".join(f"[{start_index + i + 1}]\n{msg}" for i, msg in enumerate(batch))
@@ -1607,7 +1600,7 @@ async def track_user_maturity(
             )
         else:
             # Large dataset: per-user concurrent scoring (5 users at a time)
-            print(f"[L2-8] {len(rows)} msgs / {num_users} users, ~{estimated_tokens} tokens (>= 128K) → per-user concurrent (concurrency=5)")
+            print(f"[L2-8] {len(rows)} msgs / {num_users} users, {estimated_tokens} tokens (>= 128K) → per-user concurrent (concurrency=5)")
             results = await _score_prompts_per_user(rows, llm_client, label="L2-8", concurrency=5)
 
         user_daily_scores: dict[str, dict[str, list[float]]] = {}
@@ -1691,6 +1684,269 @@ async def track_user_maturity(
         print(f"[L2-8] User maturity tracking failed: {error}")
         return {"users": []}
 
+
+
+# ─── Combined L2-4 + L2-8: Prompt Quality & User Maturity ───
+
+async def score_prompt_quality_and_maturity(
+    ck_config: CkConfig,
+    table_name: str,
+    range_: TimeRange,
+    llm_client: LlmClient,
+) -> dict:
+    """Combined analysis for L2-4 (prompt quality) and L2-8 (user maturity tracking).
+
+    Uses a single LLM call to score all prompts, then aggregates results for both
+    L2-4 format (teamAverage, byUser, topUsers, bottomUsers) and L2-8 format
+    (users with dailyScores, trend, slope).
+
+    Returns dict with keys: {"promptQuality": {...}, "userMaturity": {...}}
+    """
+    print("[Combined L2-4+L2-8] Starting combined prompt quality and maturity analysis...")
+
+    try:
+        start_time, end_time = time_range_to_sql_params(range_)
+
+        # Use L2-8's SQL query (includes day_bucket field)
+        sql = f"""
+            SELECT row_id, session_id, sender_id, content_text,
+                   toDate(timestamp) AS day_bucket, timestamp
+            FROM `{table_name}`
+            WHERE role = 'user'
+              AND timestamp >= %s AND timestamp < %s
+              AND content_text IS NOT NULL AND content_text != ''
+              AND sender_id IS NOT NULL AND sender_id != ''
+            ORDER BY sender_id, timestamp
+        """
+
+        rows = await execute_query_async(ck_config, sql, (start_time, end_time))
+
+        if not rows:
+            return {
+                "promptQuality": _empty_prompt_quality_result(),
+                "userMaturity": {"users": []},
+            }
+
+        for row in rows:
+            row["user_prompt"] = _extract_user_message(row.get("content_text") or "")
+
+        rows = [row for row in rows if row["user_prompt"]]
+
+        if not rows:
+            print("[Combined L2-4+L2-8] No valid user prompts after metadata extraction")
+            return {
+                "promptQuality": _empty_prompt_quality_result(),
+                "userMaturity": {"users": []},
+            }
+
+        messages = [row["user_prompt"][:500] for row in rows]
+        num_users = len({row["sender_id"] for row in rows})
+
+        estimated_tokens = count_tokens(messages)
+
+        # Single LLM call for scoring
+        if estimated_tokens < MAX_BATCH_TOKENS:
+            print(f"[Combined L2-4+L2-8] {len(rows)} msgs / {num_users} users, {estimated_tokens} tokens (< 128K) -> single batch")
+
+            def _build_flat_prompt(batch: list[str], start_index: int) -> str:
+                numbered = "\n\n---\n\n".join(f"[{start_index + i + 1}]\n{msg}" for i, msg in enumerate(batch))
+                return _SCORE_USER_PROMPT_TEMPLATE.format(numbered=numbered)
+
+            results = await llm_client.batch_classify(
+                messages, _PROMPT_QUALITY_SYSTEM_PROMPT, len(messages),
+                _build_flat_prompt, label="Combined:L2-4+L2-8",
+            )
+        else:
+            print(f"[Combined L2-4+L2-8] {len(rows)} msgs / {num_users} users, ~{estimated_tokens} tokens (>= 128K) -> per-user concurrent (concurrency=5)")
+            results = await _score_prompts_per_user(rows, llm_client, label="Combined:L2-4+L2-8", concurrency=5)
+
+        # Aggregate for L2-4: prompt quality
+        user_prompt_scores: dict[str, list[dict]] = {}
+        for i, row in enumerate(rows):
+            sender_id = row.get("sender_id") or "unknown"
+            raw_score = results[i] if i < len(results) else dict(_DEFAULT_SCORES)
+            score_entry = {dim: raw_score.get(dim, 1) for dim in _SCORING_DIMENSIONS}
+            score_entry["overall"] = sum(score_entry[d] for d in _SCORING_DIMENSIONS) / len(_SCORING_DIMENSIONS)
+            score_entry["user_prompt"] = row["user_prompt"]
+            score_entry["session_id"] = row["session_id"]
+            score_entry["row_id"] = row["row_id"]
+
+            if sender_id not in user_prompt_scores:
+                user_prompt_scores[sender_id] = []
+            user_prompt_scores[sender_id].append(score_entry)
+
+        by_user: list[dict] = []
+        all_dim_avgs: dict[str, list[float]] = {dim: [] for dim in _SCORING_DIMENSIONS}
+
+        for sender_id, entries in user_prompt_scores.items():
+            user_result: dict[str, Any] = {"senderId": sender_id, "promptCount": len(entries)}
+
+            for dim in _SCORING_DIMENSIONS:
+                avg_val = sum(e[dim] for e in entries) / len(entries)
+                user_result[dim] = round(avg_val, 2)
+                all_dim_avgs[dim].append(avg_val)
+
+            user_result["overall"] = round(
+                sum(user_result[d] for d in _SCORING_DIMENSIONS) / len(_SCORING_DIMENSIONS), 2
+            )
+
+            best_entry = max(entries, key=lambda e: e["overall"])
+            user_result["bestPrompt"] = {
+                "sessionId": best_entry["session_id"],
+                "rowId": best_entry["row_id"],
+                "overall": round(best_entry["overall"], 2),
+                "content": best_entry["user_prompt"],
+                "scores": {d: best_entry[d] for d in _SCORING_DIMENSIONS},
+            }
+
+            worst_entry = min(entries, key=lambda e: e["overall"])
+            user_result["worstPrompt"] = {
+                "sessionId": worst_entry["session_id"],
+                "rowId": worst_entry["row_id"],
+                "overall": round(worst_entry["overall"], 2),
+                "content": worst_entry["user_prompt"],
+                "scores": {d: worst_entry[d] for d in _SCORING_DIMENSIONS},
+            }
+
+            by_user.append(user_result)
+
+        by_user.sort(key=lambda u: u["overall"], reverse=True)
+
+        def safe_avg(values: list[float]) -> float:
+            return round(sum(values) / len(values), 2) if values else 0
+
+        team_average: dict[str, float] = {}
+        for dim in _SCORING_DIMENSIONS:
+            team_average[dim] = safe_avg(all_dim_avgs[dim])
+        team_average["overall"] = safe_avg(
+            [sum(all_dim_avgs[d][i] for d in _SCORING_DIMENSIONS) / len(_SCORING_DIMENSIONS)
+             for i in range(len(all_dim_avgs[_SCORING_DIMENSIONS[0]]))]
+        )
+
+        top_users = [
+            {
+                "senderId": u["senderId"],
+                "overall": u["overall"],
+                "bestPrompt": {
+                    "sessionId": u["bestPrompt"]["sessionId"],
+                    "rowId": u["bestPrompt"]["rowId"],
+                    "content": u["bestPrompt"]["content"],
+                    "scores": u["bestPrompt"]["scores"],
+                },
+            }
+            for u in by_user[:3]
+        ]
+
+        bottom_users = [
+            {
+                "senderId": u["senderId"],
+                "overall": u["overall"],
+                "worstPrompt": {
+                    "sessionId": u["worstPrompt"]["sessionId"],
+                    "rowId": u["worstPrompt"]["rowId"],
+                    "content": u["worstPrompt"]["content"],
+                    "scores": u["worstPrompt"]["scores"],
+                },
+            }
+            for u in by_user[-3:]
+        ]
+
+        prompt_quality_result = {
+            "teamAverage": team_average,
+            "byUser": by_user,
+            "topUsers": top_users,
+            "bottomUsers": bottom_users,
+        }
+
+        # Aggregate for L2-8: user maturity
+        user_daily_scores: dict[str, dict[str, list[float]]] = {}
+
+        for i, row in enumerate(rows):
+            sender_id = row["sender_id"]
+            day_bucket = str(row["day_bucket"])
+            raw_score = results[i] if i < len(results) else dict(_DEFAULT_SCORES)
+            overall = sum(raw_score.get(dim, 1) for dim in _SCORING_DIMENSIONS) / len(_SCORING_DIMENSIONS)
+
+            if sender_id not in user_daily_scores:
+                user_daily_scores[sender_id] = {}
+            if day_bucket not in user_daily_scores[sender_id]:
+                user_daily_scores[sender_id][day_bucket] = []
+            user_daily_scores[sender_id][day_bucket].append(overall)
+
+        users = []
+        for sender_id, day_data in user_daily_scores.items():
+            sorted_days = sorted(day_data.keys())
+            daily_scores: list[dict] = []
+            all_scores_flat: list[float] = []
+
+            for day in sorted_days:
+                scores_list = day_data[day]
+                avg_score = sum(scores_list) / len(scores_list)
+                daily_scores.append({
+                    "date": day,
+                    "overall": round(avg_score, 2),
+                    "promptCount": len(scores_list),
+                })
+                all_scores_flat.extend(scores_list)
+
+            global_avg = sum(all_scores_flat) / len(all_scores_flat) if all_scores_flat else 0
+            prompt_count = len(all_scores_flat)
+
+            all_high = all(
+                (sum(day_data[d]) / len(day_data[d])) >= _CONSISTENTLY_HIGH_THRESHOLD
+                for d in sorted_days
+            )
+
+            slope = 0.0
+            if len(sorted_days) >= 2:
+                points_x = list(range(len(sorted_days)))
+                points_y = [
+                    sum(day_data[d]) / len(day_data[d]) for d in sorted_days
+                ]
+                n = len(points_x)
+                sum_x = sum(points_x)
+                sum_y = sum(points_y)
+                sum_xy = sum(x * y for x, y in zip(points_x, points_y))
+                sum_xx = sum(x * x for x in points_x)
+                denominator = n * sum_xx - sum_x ** 2
+                if denominator != 0:
+                    slope = (n * sum_xy - sum_x * sum_y) / denominator
+
+            if all_high:
+                trend = "consistently_high"
+            elif slope > 0.1:
+                trend = "improving"
+            elif slope < -0.1:
+                trend = "declining"
+            else:
+                trend = "stable"
+
+            users.append({
+                "senderId": sender_id,
+                "promptCount": prompt_count,
+                "overallAvg": round(global_avg, 2),
+                "dailyScores": daily_scores,
+                "trend": trend,
+                "slope": round(slope, 4),
+            })
+
+        trend_priority = {"improving": 0, "declining": 1, "stable": 2, "consistently_high": 3}
+        users.sort(key=lambda u: (trend_priority.get(u["trend"], 9), -u["slope"]))
+
+        user_maturity_result = {"users": users}
+
+        print(f"[Combined L2-4+L2-8] Completed: {len(user_prompt_scores)} users, top/bottom 3 identified, {len(users)} users tracked")
+        return {
+            "promptQuality": prompt_quality_result,
+            "userMaturity": user_maturity_result,
+        }
+
+    except Exception as error:
+        print(f"[Combined L2-4+L2-8] Analysis failed: {error}")
+        return {
+            "promptQuality": _empty_prompt_quality_result(),
+            "userMaturity": {"users": []},
+        }
 
 # ─── Main L2 Analysis Runner ───
 

@@ -29,18 +29,17 @@ from scripts.analysis.operational_insight import (
     analyze_anomalies,
 )
 from scripts.analysis.behavior_insight import (
-    classify_intents,
+    classify_messages_combined,
     assess_task_complexity,
     estimate_task_success_rate,
     score_prompt_quality,
-    cluster_topics,
+    score_prompt_quality_and_maturity,
     detect_retry_behavior,
     analyze_thinking_depth,
     track_user_maturity,
 )
 from scripts.analysis.organizational_insight import (
-    run_l3_independent_cases,
-    discover_skill_candidates,
+    run_l3_independent_cases_no_tech_stack,
     generate_narrative_report,
     generate_structured_report,
 )
@@ -248,42 +247,43 @@ class AnalysisOrchestrator:
             async def _l3_independent_group() -> dict | None:
                 if not analysis_config.enable_l3 or not llm_client:
                     return None
-                return await run_l3_independent_cases(
+                return await run_l3_independent_cases_no_tech_stack(
                     self._config.adb, self._table_name, analysis_range, llm_client,
                 )
 
-            print("[Orchestrator] Phase 1: Running L1 + L2 + L3-independent (L3-1/2/3) in parallel...")
-            l1_results, l2_results, l3_independent = await asyncio.gather(
-                _l1_group(), _l2_group(), _l3_independent_group(),
+            async def _combined_group() -> dict | None:
+                if not llm_client:
+                    print("[Orchestrator] ⚠️ Combined (L2-1+L2-5+L3-1) skipped: requires LLM config")
+                    return None
+                return await self._run_combined_analysis(run_id, analysis_range, llm_client)
+
+            print("[Orchestrator] Phase 1: Running L1 + L2 + L3-2/3/4 + Combined(L2-1/L2-5/L3-1) in parallel...")
+            l1_results, l2_results, l3_independent, combined_result = await asyncio.gather(
+                _l1_group(), _l2_group(), _l3_independent_group(), _combined_group(),
             )
+            # Inject combined results into l2_results and l3_independent
+            if combined_result:
+                if l2_results is None:
+                    l2_results = {}
+                l2_results["intents"] = combined_result.get("intents", {})
+                l2_results["topics"] = combined_result.get("topics", {})
+                if l3_independent is None:
+                    l3_independent = {}
+                l3_independent["techStack"] = combined_result.get("tech_stack", {})
             print("[Orchestrator] Phase 1 complete.")
 
-            # ── Phase 2: L3-4 (depends on L1+L2) + merge ──
+            # ── Merge L3 results ──
             l3_results: dict | None = None
-            if analysis_config.enable_l3 and llm_client and l1_results and l2_results:
-                print("[Orchestrator] Phase 2: Running L3-4 (skill candidates)...")
-                skill_candidates = await discover_skill_candidates(
-                    l1_results.get("toolChains", {}),
-                    l2_results.get("topics", {}),
-                    l2_results.get("intents", {}),
-                    llm_client,
-                )
-                l3_results = {
-                    **(l3_independent or {}),
-                    "skillCandidates": skill_candidates,
-                }
-                # Persist the combined L3 result
-                self._save_case_result(
-                    run_id, "L3", "L3_ORGANIZATIONAL", analysis_range,
-                    status="success",
-                    elapsed=0.0,
-                    summary="L3 完成: techStack, repeatedQuestions, bestPractices, skillCandidates",
-                    details=l3_results,
-                )
-                print("[Orchestrator] Phase 2 complete.")
-            elif analysis_config.enable_l3:
-                print("[Orchestrator] ⚠️ L3-4 skipped: requires LLM config and L1/L2 results")
+            if analysis_config.enable_l3:
                 l3_results = l3_independent or {}
+                if l3_results:
+                    self._save_case_result(
+                        run_id, "L3", "L3_ORGANIZATIONAL", analysis_range,
+                        status="success",
+                        elapsed=0.0,
+                        summary="L3 完成: techStack, repeatedQuestions, bestPractices, skillCandidates",
+                        details=l3_results,
+                    )
 
             # ── Final Report (L3-5) ──
             final_report_text: str = ""
@@ -321,12 +321,19 @@ class AnalysisOrchestrator:
         elapsed_str = f"{minutes}m {seconds}s ({total_elapsed:.1f}s)" if minutes else f"{total_elapsed:.1f}s"
 
         final_report_path = Path("output") / "final_report.md"
+        html_report_path = Path("output") / "final_report.html"
 
         print("\n" + "=" * 60)
         print("🎉 Full Analysis Completed")
         print(f"   Run ID:      {run_id}")
         print(f"   Report:      {final_report_path}")
+        if analysis_config.generate_html_report and html_report_path.exists():
+            print(f"   HTML Report: {html_report_path}")
         print(f"   Total time:  {elapsed_str}")
+        if llm_client:
+            u = llm_client.token_usage
+            print(f"   LLM calls:   {u['call_count']} requests")
+            print(f"   Tokens used: input={u['input_tokens']:,}  output={u['output_tokens']:,}  total={u['total_tokens']:,}")
         print("=" * 60)
 
         return run_id
@@ -356,13 +363,16 @@ class AnalysisOrchestrator:
         analysis_range: TimeRange,
         llm_client: Optional[LlmClient],
     ) -> dict:
-        """Run all L2 cases in parallel and return a combined results dict."""
+        """Run all L2 cases in parallel and return a combined results dict.
+
+        Note: L2-1 (intents) and L2-5 (topics) are handled by the combined
+        analysis group (_run_combined_analysis), not here.
+        L2-4 (prompt quality) and L2-8 (user maturity) are combined into a single call.
+        All cases run concurrently via asyncio.gather.
+        """
         adb = self._config.adb
         table = self._table_name
-        max_items = (self._config.analysis.max_sessions_for_llm
-                     if self._config.analysis else 100)
 
-        # Build (key, case_name, fn, args) specs
         task_specs: list[tuple[str, str, object, tuple]] = [
             ("complexity",    "L2-2", assess_task_complexity,      (adb, table, analysis_range)),
             ("successRate",   "L2-3", estimate_task_success_rate,  (adb, table, analysis_range)),
@@ -370,24 +380,138 @@ class AnalysisOrchestrator:
             ("thinkingDepth", "L2-7", analyze_thinking_depth,      (adb, table, analysis_range)),
         ]
 
-        if llm_client:
-            task_specs += [
-                ("intents",      "L2-1", classify_intents,   (adb, table, analysis_range, llm_client, max_items)),
-                ("promptQuality","L2-4", score_prompt_quality,(adb, table, analysis_range, llm_client)),
-                ("topics",       "L2-5", cluster_topics,      (adb, table, analysis_range, llm_client)),
-                ("userMaturity", "L2-8", track_user_maturity, (adb, table, analysis_range, llm_client)),
-            ]
-        else:
-            for case in ["L2-1", "L2-4", "L2-5", "L2-8"]:
-                print(f"[Orchestrator] ⚠️ {case} skipped: requires LLM config")
-
+        # Build non-LLM tasks
         keys  = [s[0] for s in task_specs]
         tasks = [
             self._run_and_save_case(run_id, s[1], "L2_BEHAVIOR", analysis_range, s[2], s[3])
             for s in task_specs
         ]
+
+        # Add combined L2-4 + L2-8 as a concurrent task (not sequential)
+        async def _run_l2_4_8() -> dict:
+            if not llm_client:
+                for case in ["L2-4", "L2-8"]:
+                    print(f"[Orchestrator] ⚠️ {case} skipped: requires LLM config")
+                return {}
+            print("\n" + "─" * 50)
+            print("▶ Running Combined (L2-4 + L2-8) [prompt quality + user maturity]...")
+            start = time.time()
+            try:
+                combined = await score_prompt_quality_and_maturity(
+                    adb, table, analysis_range, llm_client,
+                )
+                elapsed = time.time() - start
+
+                prompt_quality = combined.get("promptQuality", {})
+                user_maturity = combined.get("userMaturity", {})
+
+                # Summarize and persist L2-4
+                team_avg = prompt_quality.get("teamAverage", {})
+                overall = team_avg.get("overall", 0)
+                top_users = prompt_quality.get("topUsers", [])
+                top_user_strs = [f"{u.get('senderId', '?')}({u.get('overall', 0):.2f})" for u in top_users]
+                summary_l2_4 = f"团队平均分: {overall:.2f}, Top3: {', '.join(top_user_strs)}"
+                self._save_case_result(run_id, "L2-4", "L2_BEHAVIOR", analysis_range,
+                                       status="success", elapsed=elapsed, summary=summary_l2_4, details=prompt_quality)
+                print(f"✅ L2-4 (combined) — {summary_l2_4}")
+
+                # Summarize and persist L2-8
+                users = user_maturity.get("users", [])
+                improving = [u for u in users if u.get("trend") == "improving"]
+                summary_l2_8 = f"共 {len(users)} 用户, {len(improving)} 用户呈上升趋势"
+                self._save_case_result(run_id, "L2-8", "L2_BEHAVIOR", analysis_range,
+                                       status="success", elapsed=elapsed, summary=summary_l2_8, details=user_maturity)
+                print(f"✅ L2-8 (combined) — {summary_l2_8}")
+
+                print(f"✅ Combined L2-4+L2-8 finished in {elapsed:.1f}s")
+                return {"promptQuality": prompt_quality, "userMaturity": user_maturity}
+            except Exception as exc:
+                elapsed = time.time() - start
+                error_msg = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+                print(f"❌ Combined L2-4+L2-8 failed in {elapsed:.1f}s: {exc}")
+                for case in ("L2-4", "L2-8"):
+                    self._save_case_result(run_id, case, "L2_BEHAVIOR", analysis_range,
+                                           status="failure", elapsed=elapsed,
+                                           summary=f"执行失败: {exc}", details={}, error_message=error_msg)
+                return {}
+
+        tasks.append(_run_l2_4_8())
+        keys.append("_l2_4_8_combined")
+
+        # Run ALL L2 cases concurrently
         results = await asyncio.gather(*tasks)
-        return {k: v for k, v in zip(keys, results) if v is not None}
+        l2_results = {k: v for k, v in zip(keys, results) if v is not None}
+
+        # Merge L2-4+L2-8 combined result into top-level keys
+        l2_4_8 = l2_results.pop("_l2_4_8_combined", {})
+        if l2_4_8:
+            l2_results["promptQuality"] = l2_4_8.get("promptQuality", {})
+            l2_results["userMaturity"] = l2_4_8.get("userMaturity", {})
+
+        return l2_results
+
+    async def _run_combined_analysis(
+        self,
+        run_id: str,
+        analysis_range: TimeRange,
+        llm_client: LlmClient,
+    ) -> dict:
+        """Run combined L2-1 + L2-5 + L3-1 analysis and persist each sub-result separately."""
+        adb = self._config.adb
+        table = self._table_name
+        max_items = (self._config.analysis.max_sessions_for_llm
+                     if self._config.analysis else 500)
+
+        print(f"\n{'─'*50}")
+        print("▶ Running Combined (L2-1 + L2-5 + L3-1) [per-user aggregated]...")
+        start = time.time()
+        try:
+            combined = await classify_messages_combined(
+                adb, table, analysis_range, llm_client, max_items,
+            )
+            elapsed = time.time() - start
+
+            intents = combined.get("intents", {})
+            topics = combined.get("topics", {})
+            tech_stack = combined.get("tech_stack", {})
+
+            # Summarize and persist L2-1
+            dist = intents.get("distribution", {})
+            total = sum(dist.values())
+            top = sorted(dist.items(), key=lambda x: x[1], reverse=True)[:5]
+            summary_l2_1 = f"共 {total} 条消息, {len(dist)} 种意图. Top: {', '.join(f'{k}({v})' for k, v in top)}"
+            self._save_case_result(run_id, "L2-1", "L2_BEHAVIOR", analysis_range,
+                                   status="success", elapsed=elapsed, summary=summary_l2_1, details=intents)
+            print(f"✅ L2-1 (combined) — {summary_l2_1}")
+
+            # Summarize and persist L2-5
+            cat_dist = topics.get("categoryDistribution", {})
+            top_tags = topics.get("topTags", [])
+            cat_parts = [f"{k}={v}" for k, v in sorted(cat_dist.items(), key=lambda x: x[1], reverse=True)[:5]]
+            summary_l2_5 = f"共 {sum(cat_dist.values())} 条消息, {len(cat_dist)} 个分类, {len(top_tags)} 个标签. Top: {', '.join(cat_parts)}"
+            self._save_case_result(run_id, "L2-5", "L2_BEHAVIOR", analysis_range,
+                                   status="success", elapsed=elapsed, summary=summary_l2_5, details=topics)
+            print(f"✅ L2-5 (combined) — {summary_l2_5}")
+
+            # Summarize and persist L3-1
+            techs = tech_stack.get("technologies", [])
+            summary_l3_1 = f"识别出 {len(techs)} 种技术栈"
+            self._save_case_result(run_id, "L3-1", "L3_ORGANIZATIONAL", analysis_range,
+                                   status="success", elapsed=elapsed, summary=summary_l3_1, details=tech_stack)
+            print(f"✅ L3-1 (combined) — {summary_l3_1}")
+
+            print(f"✅ Combined analysis finished in {elapsed:.1f}s")
+            return combined
+
+        except Exception as exc:
+            elapsed = time.time() - start
+            error_msg = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+            print(f"❌ Combined analysis failed in {elapsed:.1f}s: {exc}")
+            for case in ("L2-1", "L2-5", "L3-1"):
+                self._save_case_result(run_id, case, "L2_BEHAVIOR", analysis_range,
+                                       status="failure", elapsed=elapsed,
+                                       summary=f"执行失败: {exc}", details={}, error_message=error_msg)
+            return {}
 
     async def _run_and_save_case(
         self,
@@ -527,7 +651,7 @@ class AnalysisOrchestrator:
                 "l2": l2_results,
                 "l3": l3_results,
             }
-            result = await generate_structured_report(all_results, range_, llm_client)
+            result = generate_structured_report(all_results, range_)
             elapsed = time.time() - start
 
             report_text = result.get("report", "")
@@ -582,7 +706,7 @@ class AnalysisOrchestrator:
                 "l2": l2_results,
                 "l3": l3_results,
             }
-            result = await generate_narrative_report(all_results, range_, llm_client)
+            result = generate_narrative_report(all_results, range_)
             elapsed = time.time() - start
 
             report_text = result.get("report", "")
@@ -716,10 +840,13 @@ class AnalysisOrchestrator:
                     print(f"     {uid}: s={counts.get('success',0)} p={counts.get('partial',0)} f={counts.get('failure',0)} ({rate:.0f}%)")
             failures = details.get("failures", [])
             if failures:
-                print(f"   失败明细 ({len(failures)} 条):")
-                for item in failures:
+                display_limit = 3
+                print(f"   失败明细 (共 {len(failures)} 条, 显示前 {min(display_limit, len(failures))} 条):")
+                for item in failures[:display_limit]:
                     print(f"     session={item['sessionId']} sender={item['senderId']} "
                           f"start={item.get('startRowId','?')} end={item.get('endRowId','?')}")
+                if len(failures) > display_limit:
+                    print(f"     ... 省略 {len(failures) - display_limit} 条")
 
         elif case_name == "L2-6":
             top_retry = details.get("topRetrySessions", [])

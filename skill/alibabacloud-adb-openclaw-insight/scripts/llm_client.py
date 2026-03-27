@@ -15,7 +15,31 @@ import re
 import time
 from typing import Any, Callable
 
+import tiktoken
+
 from scripts.config import LlmConfig
+
+# ─── Token Counting ───
+
+# Use cl100k_base encoding (GPT-4 / GPT-3.5 compatible).
+# This provides accurate token counts for OpenAI models and a close
+# approximation for other LLMs (qwen, deepseek, etc.) — typically <5% error.
+_TOKENIZER = tiktoken.get_encoding("cl100k_base")
+
+_MAX_BATCH_TOKENS = 128_000
+
+
+def count_tokens(texts: list[str]) -> int:
+    """Count the total number of tokens across all texts using tiktoken.
+
+    Uses cl100k_base encoding for accurate, local token counting.
+    """
+    return sum(len(_TOKENIZER.encode(text)) for text in texts)
+
+
+def count_tokens_single(text: str) -> int:
+    """Count tokens for a single text string."""
+    return len(_TOKENIZER.encode(text))
 
 
 def _extract_json_from_response(response: str) -> Any:
@@ -115,6 +139,12 @@ class LlmClient:
         self._config = config
         self._semaphore = asyncio.Semaphore(config.max_concurrency)
 
+        # Token usage counters (thread-safe via asyncio.Lock)
+        self._input_tokens: int = 0
+        self._output_tokens: int = 0
+        self._call_count: int = 0
+        self._token_lock = asyncio.Lock()
+
         if config.api_type == "anthropic":
             import anthropic
             base_url = _build_anthropic_base_url(config.endpoint)
@@ -138,27 +168,54 @@ class LlmClient:
             self._anthropic_client = None
             print(f"[LLM] Initialized AsyncOpenAI SDK, model: {config.model}, base_url: {base_url}")
 
+    @property
+    def token_usage(self) -> dict:
+        """Return accumulated token usage across all API calls so far."""
+        return {
+            "input_tokens": self._input_tokens,
+            "output_tokens": self._output_tokens,
+            "total_tokens": self._input_tokens + self._output_tokens,
+            "call_count": self._call_count,
+        }
+
+    def print_token_usage(self, label: str = "Total LLM token usage") -> None:
+        """Print a formatted token usage summary."""
+        u = self.token_usage
+        print(
+            f"[LLM] {label}: "
+            f"input={u['input_tokens']:,}  output={u['output_tokens']:,}  "
+            f"total={u['total_tokens']:,}  calls={u['call_count']}"
+        )
+
     async def _call_api(self, messages: list[dict]) -> str:
         """Async API call using official SDK with built-in retry."""
         start_time = time.time()
 
         try:
             if self._anthropic_client is not None:
-                result = await self._call_anthropic(messages)
+                text, in_tok, out_tok = await self._call_anthropic(messages)
             else:
-                result = await self._call_openai(messages)
+                text, in_tok, out_tok = await self._call_openai(messages)
 
             elapsed = time.time() - start_time
-            print(f"[LLM] API call completed in {elapsed:.1f}s ({len(result)} chars)")
-            return result
+            async with self._token_lock:
+                self._input_tokens += in_tok
+                self._output_tokens += out_tok
+                self._call_count += 1
+
+            print(
+                f"[LLM] API call completed in {elapsed:.1f}s "
+                f"({len(text)} chars, in={in_tok} out={out_tok} tokens)"
+            )
+            return text
 
         except Exception as error:
             elapsed = time.time() - start_time
             print(f"[LLM] API call failed after {elapsed:.1f}s: {error}")
             raise
 
-    async def _call_openai(self, messages: list[dict]) -> str:
-        """Call OpenAI-compatible API using async SDK."""
+    async def _call_openai(self, messages: list[dict]) -> tuple[str, int, int]:
+        """Call OpenAI-compatible API. Returns (text, input_tokens, output_tokens)."""
         response = await self._openai_client.chat.completions.create(
             model=self._config.model,
             messages=messages,
@@ -168,10 +225,14 @@ class LlmClient:
         content = response.choices[0].message.content
         if not content:
             raise ValueError("[LLM:OpenAI] Empty response: no content returned")
-        return content
 
-    async def _call_anthropic(self, messages: list[dict]) -> str:
-        """Call Anthropic API using async SDK."""
+        usage = response.usage
+        in_tok = getattr(usage, "prompt_tokens", 0) or 0
+        out_tok = getattr(usage, "completion_tokens", 0) or 0
+        return content, in_tok, out_tok
+
+    async def _call_anthropic(self, messages: list[dict]) -> tuple[str, int, int]:
+        """Call Anthropic API. Returns (text, input_tokens, output_tokens)."""
         system_prompt: str | None = None
         anthropic_messages: list[dict] = []
 
@@ -195,9 +256,13 @@ class LlmClient:
 
         response = await self._anthropic_client.messages.create(**kwargs)
 
+        usage = response.usage
+        in_tok = getattr(usage, "input_tokens", 0) or 0
+        out_tok = getattr(usage, "output_tokens", 0) or 0
+
         for block in response.content:
             if block.type == "text":
-                return block.text
+                return block.text, in_tok, out_tok
 
         raise ValueError("[LLM:Anthropic] No text content block found in response")
 

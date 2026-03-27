@@ -11,7 +11,7 @@ from typing import Any
 
 from scripts.config import AdbConfig
 from scripts.db import execute_query_async
-from scripts.llm_client import LlmClient
+from scripts.llm_client import LlmClient, count_tokens, count_tokens_single, _MAX_BATCH_TOKENS as MAX_BATCH_TOKENS
 from scripts.types import TimeRange, time_range_to_sql_params
 
 
@@ -140,25 +140,22 @@ async def classify_intents(
             print("[L2-1] No valid user messages after metadata extraction")
             return {"distribution": {}, "byUser": {}, "items": []}
 
-        messages = [row["message_text"] for row in rows]
+        messages = [row["message_text"][:500] for row in rows]
 
-        # Estimate total tokens: ~1.5 tokens per Chinese char, ~0.75 per English word/char on average
-        total_chars = sum(len(msg) for msg in messages)
-        estimated_tokens = int(total_chars * 1.5)
-        max_single_batch_tokens = 128_000
+        estimated_tokens = count_tokens(messages)
 
-        if estimated_tokens < max_single_batch_tokens:
+        if estimated_tokens < MAX_BATCH_TOKENS:
             batch_size = len(messages)
-            print(f"[L2-1] Estimated {estimated_tokens} tokens (< 128K), sending all in one batch")
+            print(f"[L2-1] {estimated_tokens} tokens (< 128K), sending all in one batch")
         else:
             batch_size = 15
-            print(f"[L2-1] Estimated {estimated_tokens} tokens (>= 128K), splitting into batches of {batch_size}")
+            print(f"[L2-1] {estimated_tokens} tokens (>= 128K), splitting into batches of {batch_size}")
 
         def build_user_prompt(batch: list[str], start_index: int) -> str:
             numbered = "\n\n".join(f"{start_index + i + 1}. {msg}" for i, msg in enumerate(batch))
             return f"请对以下用户消息进行意图分类：\n\n{numbered}\n\n返回 JSON 数组，每个元素包含 category 和 confidence。"
 
-        print(f"[L2-1] Queried {len(rows)} user messages ({total_chars} chars), sending to LLM for classification...")
+        print(f"[L2-1] Queried {len(rows)} user messages ({estimated_tokens} tokens), sending to LLM for classification...")
         results = await llm_client.batch_classify(
             messages, _INTENT_SYSTEM_PROMPT, batch_size, build_user_prompt, label="L2-1:intent"
         )
@@ -493,6 +490,135 @@ _SCORING_DIMENSIONS = [
 
 _DEFAULT_SCORES = {dim: 1 for dim in _SCORING_DIMENSIONS}
 
+_SCORE_USER_PROMPT_TEMPLATE = (
+    "Evaluate these user prompts on the 6 dimensions described above.\n\n"
+    "{numbered}\n\n"
+    "Return a JSON array with goal_clarity, context_provided, chain_of_thought, "
+    "few_shot_examples, iteration_signals, specificity for each prompt."
+)
+
+
+
+def _make_token_bounded_batches(
+    user_ids: list[str],
+    user_tokens: dict[str, int],
+    max_tokens: int = MAX_BATCH_TOKENS,
+) -> list[list[str]]:
+    """Greedily pack users into batches that each stay under max_tokens.
+
+    Each user that alone exceeds max_tokens gets its own single-user batch.
+    Returns a list of batches (each batch = list of user_ids).
+    """
+    batches: list[list[str]] = []
+    current_batch: list[str] = []
+    current_tokens = 0
+
+    for uid in user_ids:
+        t = user_tokens[uid]
+        if current_batch and current_tokens + t > max_tokens:
+            batches.append(current_batch)
+            current_batch = [uid]
+            current_tokens = t
+        else:
+            current_batch.append(uid)
+            current_tokens += t
+
+    if current_batch:
+        batches.append(current_batch)
+
+    return batches
+
+
+async def _score_prompts_per_user(
+    rows: list[dict],
+    llm_client: LlmClient,
+    label: str = "score",
+    concurrency: int = 5,
+    msg_truncate: int = 500,
+) -> list[dict]:
+    """Score prompts grouped by user, batching multiple users per LLM request.
+
+    Groups rows by sender_id, builds context strings per user, then packs as
+    many users as possible into each request (up to 128K estimated tokens).
+    Runs `concurrency` batches concurrently.
+
+    Returns a list of score dicts in the same order as `rows`.
+    """
+    # Group rows by sender_id, keeping original index for result alignment
+    user_rows: dict[str, list[tuple[int, dict]]] = {}
+    for idx, row in enumerate(rows):
+        uid = row["sender_id"]
+        if uid not in user_rows:
+            user_rows[uid] = []
+        user_rows[uid].append((idx, row))
+
+    user_ids = list(user_rows.keys())
+    results: list[dict] = [dict(_DEFAULT_SCORES)] * len(rows)
+
+    # Build per-user context strings + estimate tokens
+    user_context: dict[str, str] = {}
+    user_tokens: dict[str, int] = {}
+    for uid in user_ids:
+        indexed_rows = user_rows[uid]
+        msgs = [r["user_prompt"][:msg_truncate] for _, r in indexed_rows]
+        ctx = "\n\n---\n\n".join(f"[{i + 1}]\n{msg}" for i, msg in enumerate(msgs))
+        user_context[uid] = ctx
+        user_tokens[uid] = count_tokens_single(ctx)
+
+    batches = _make_token_bounded_batches(user_ids, user_tokens)
+    total_batches = len(batches)
+    total_tokens = sum(user_tokens.values())
+    print(
+        f"[{label}] {len(user_ids)} users, {total_tokens} tokens → "
+        f"{total_batches} batches (token-bounded, concurrency={concurrency})"
+    )
+
+    sem = asyncio.Semaphore(concurrency)
+    completed = 0
+
+    async def score_batch(batch_uids: list[str], batch_idx: int) -> None:
+        nonlocal completed
+        # Build a combined numbered prompt across all users in this batch
+        all_indexed_rows: list[tuple[int, dict]] = []  # (orig_idx, row)
+        numbered_parts: list[str] = []
+        global_num = 1
+        user_msg_counts: list[tuple[str, int]] = []  # (uid, msg_count)
+
+        for uid in batch_uids:
+            indexed_rows = user_rows[uid]
+            msg_count = len(indexed_rows)
+            user_msg_counts.append((uid, msg_count))
+            all_indexed_rows.extend(indexed_rows)
+            msgs = [r["user_prompt"][:msg_truncate] for _, r in indexed_rows]
+            for msg in msgs:
+                numbered_parts.append(f"[{global_num}]\n{msg}")
+                global_num += 1
+
+        total_msgs = len(all_indexed_rows)
+        numbered = "\n\n---\n\n".join(numbered_parts)
+        user_prompt = _SCORE_USER_PROMPT_TEMPLATE.format(numbered=numbered)
+
+        async with sem:
+            try:
+                raw = await llm_client.chat_json(_PROMPT_QUALITY_SYSTEM_PROMPT, user_prompt)
+                if not isinstance(raw, list):
+                    raw = [raw] * total_msgs
+            except Exception as exc:
+                batch_uids_str = ",".join(batch_uids)
+                print(f"[{label}] Batch {batch_idx + 1} scoring failed ({batch_uids_str}): {exc}")
+                raw = []
+
+            completed += 1
+            uids_str = ",".join(batch_uids)
+            print(f"[{label}] Batch {completed}/{total_batches} done (users={uids_str}, msgs={total_msgs})")
+
+        # Map flat raw scores back to original row indices
+        for j, (orig_idx, _) in enumerate(all_indexed_rows):
+            results[orig_idx] = raw[j] if j < len(raw) else dict(_DEFAULT_SCORES)
+
+    await asyncio.gather(*[score_batch(batch, i) for i, batch in enumerate(batches)])
+    return results
+
 
 async def score_prompt_quality(
     adb_config: AdbConfig,
@@ -532,36 +658,28 @@ async def score_prompt_quality(
             print("[L2-4] No valid user prompts after metadata extraction")
             return _empty_prompt_quality_result()
 
-        messages = [row["user_prompt"] for row in rows]
+        messages = [row["user_prompt"][:500] for row in rows]
+        num_users = len({row["sender_id"] for row in rows})
 
-        # Apply single-batch strategy: if total tokens < 128K, send all at once
-        total_chars = sum(len(msg) for msg in messages)
-        estimated_tokens = int(total_chars * 1.5)
-        max_single_batch_tokens = 128_000
+        estimated_tokens = count_tokens(messages)
 
-        if estimated_tokens < max_single_batch_tokens:
-            batch_size = len(messages)
-            print(f"[L2-4] Estimated {estimated_tokens} tokens (< 128K), sending all in one batch")
+        if estimated_tokens < MAX_BATCH_TOKENS:
+            # Small dataset: single flat batch (all messages together)
+            print(f"[L2-4] {len(rows)} msgs / {num_users} users, {estimated_tokens} tokens (< 128K) → single batch")
+
+            def _build_flat_prompt(batch: list[str], start_index: int) -> str:
+                numbered = "\n\n---\n\n".join(f"[{start_index + i + 1}]\n{msg}" for i, msg in enumerate(batch))
+                return _SCORE_USER_PROMPT_TEMPLATE.format(numbered=numbered)
+
+            print(f"[L2-4] Queried {len(rows)} sessions, sending to LLM for prompt quality scoring...")
+            results = await llm_client.batch_classify(
+                messages, _PROMPT_QUALITY_SYSTEM_PROMPT, len(messages),
+                _build_flat_prompt, label="L2-4:prompt_quality",
+            )
         else:
-            batch_size = 10
-            print(f"[L2-4] Estimated {estimated_tokens} tokens (>= 128K), splitting into batches of {batch_size}")
-
-        def build_user_prompt(batch: list[str], start_index: int) -> str:
-            numbered = "\n\n---\n\n".join(
-                f"[{start_index + i + 1}]\n{msg}" for i, msg in enumerate(batch)
-            )
-            return (
-                f"Evaluate these user prompts on the 6 dimensions described above.\n\n"
-                f"{numbered}\n\n"
-                f"Return a JSON array with goal_clarity, context_provided, chain_of_thought, "
-                f"few_shot_examples, iteration_signals, specificity for each prompt."
-            )
-
-        print(f"[L2-4] Queried {len(rows)} sessions, sending to LLM for prompt quality scoring...")
-        results = await llm_client.batch_classify(
-            messages, _PROMPT_QUALITY_SYSTEM_PROMPT, batch_size,
-            build_user_prompt, label="L2-4:prompt_quality",
-        )
+            # Large dataset: per-user concurrent scoring with token-bounded batching
+            print(f"[L2-4] {len(rows)} msgs / {num_users} users, {estimated_tokens} tokens (>= 128K) → per-user concurrent (concurrency=5)")
+            results = await _score_prompts_per_user(rows, llm_client, label="L2-4", concurrency=5)
 
         # ── Aggregate scores per user ──
         user_prompt_scores: dict[str, list[dict]] = {}
@@ -793,19 +911,16 @@ async def cluster_topics(
             print("[L2-5] No valid user messages after metadata extraction")
             return {"categoryDistribution": {}, "topTags": [], "byUser": {}}
 
-        messages = [row["user_message"] for row in rows]
+        messages = [row["user_message"][:500] for row in rows]
 
-        # Apply single-batch strategy: if total tokens < 128K, send all at once
-        total_chars = sum(len(msg) for msg in messages)
-        estimated_tokens = int(total_chars * 1.5)
-        max_single_batch_tokens = 128_000
+        estimated_tokens = count_tokens(messages)
 
-        if estimated_tokens < max_single_batch_tokens:
+        if estimated_tokens < MAX_BATCH_TOKENS:
             batch_size = len(messages)
-            print(f"[L2-5] Estimated {estimated_tokens} tokens (< 128K), sending all in one batch")
+            print(f"[L2-5] {estimated_tokens} tokens (< 128K), sending all in one batch")
         else:
             batch_size = 15
-            print(f"[L2-5] Estimated {estimated_tokens} tokens (>= 128K), splitting into batches of {batch_size}")
+            print(f"[L2-5] {estimated_tokens} tokens (>= 128K), splitting into batches of {batch_size}")
 
         def build_user_prompt(batch: list[str], start_index: int) -> str:
             numbered = "\n\n---\n\n".join(
@@ -1105,36 +1220,28 @@ async def track_user_maturity(
             print("[L2-8] No valid user prompts after metadata extraction")
             return {"users": []}
 
-        messages = [row["user_prompt"] for row in rows]
+        messages = [row["user_prompt"][:500] for row in rows]
 
-        # Apply 128K single-batch strategy
-        total_chars = sum(len(msg) for msg in messages)
-        estimated_tokens = int(total_chars * 1.5)
-        max_single_batch_tokens = 128_000
+        num_users = len({row["sender_id"] for row in rows})
+        estimated_tokens = count_tokens(messages)
 
-        if estimated_tokens < max_single_batch_tokens:
-            batch_size = len(messages)
-            print(f"[L2-8] Estimated {estimated_tokens} tokens (< 128K), sending all in one batch")
+        if estimated_tokens < MAX_BATCH_TOKENS:
+            # Small dataset: single flat batch (all messages together)
+            print(f"[L2-8] {len(rows)} msgs / {num_users} users, {estimated_tokens} tokens (< 128K) → single batch")
+
+            def _build_flat_prompt_l28(batch: list[str], start_index: int) -> str:
+                numbered = "\n\n---\n\n".join(f"[{start_index + i + 1}]\n{msg}" for i, msg in enumerate(batch))
+                return _SCORE_USER_PROMPT_TEMPLATE.format(numbered=numbered)
+
+            print(f"[L2-8] Scoring {len(messages)} user messages for maturity tracking...")
+            results = await llm_client.batch_classify(
+                messages, _PROMPT_QUALITY_SYSTEM_PROMPT, len(messages),
+                _build_flat_prompt_l28, label="L2-8:maturity",
+            )
         else:
-            batch_size = 10
-            print(f"[L2-8] Estimated {estimated_tokens} tokens (>= 128K), splitting into batches of {batch_size}")
-
-        def build_user_prompt(batch: list[str], start_index: int) -> str:
-            numbered = "\n\n---\n\n".join(
-                f"[{start_index + i + 1}]\n{msg}" for i, msg in enumerate(batch)
-            )
-            return (
-                f"Evaluate these user prompts on the 6 dimensions described above.\n\n"
-                f"{numbered}\n\n"
-                f"Return a JSON array with goal_clarity, context_provided, chain_of_thought, "
-                f"few_shot_examples, iteration_signals, specificity for each prompt."
-            )
-
-        print(f"[L2-8] Scoring {len(messages)} user messages for maturity tracking...")
-        results = await llm_client.batch_classify(
-            messages, _PROMPT_QUALITY_SYSTEM_PROMPT, batch_size,
-            build_user_prompt, label="L2-8:maturity",
-        )
+            # Large dataset: per-user concurrent scoring with token-bounded batching
+            print(f"[L2-8] {len(rows)} msgs / {num_users} users, {estimated_tokens} tokens (>= 128K) → per-user concurrent (concurrency=5)")
+            results = await _score_prompts_per_user(rows, llm_client, label="L2-8", concurrency=5)
 
         # ── Build per-user daily score timeline ──
         # Structure: { sender_id: [ { day, overall }, ... ] }
@@ -1218,10 +1325,632 @@ async def track_user_maturity(
 
         print(f"[L2-8] Tracked maturity for {len(users)} users across {len(set(d for dd in user_daily_scores.values() for d in dd))} days")
         return {"users": users}
-
     except Exception as error:
         print(f"[L2-8] User maturity tracking failed: {error}")
         return {"users": []}
+
+# ─── Combined: L2-4 + L2-8 (Prompt Quality + User Maturity) ───
+
+async def score_prompt_quality_and_maturity(
+    adb_config: AdbConfig,
+    table_name: str,
+    range_: TimeRange,
+    llm_client: LlmClient,
+) -> dict:
+    """Combined analysis for L2-4 (prompt quality) and L2-8 (user maturity).
+
+    Uses a single LLM call to score all user messages, then aggregates results
+    for both prompt quality metrics and user maturity tracking.
+
+    Returns dict with keys 'promptQuality' and 'userMaturity'.
+    """
+    print("[L2-4+8] Starting combined prompt quality and maturity tracking...")
+
+    try:
+        start_time, end_time = time_range_to_sql_params(range_)
+
+        # Query ALL user messages with day_bucket (from L2-8)
+        sql = f"""
+            SELECT row_id, session_id, sender_id, content_text,
+                   DATE(timestamp) AS day_bucket, timestamp
+            FROM `{table_name}`
+            WHERE role = 'user'
+              AND timestamp >= %s AND timestamp < %s
+              AND content_text IS NOT NULL AND content_text != ''
+              AND sender_id IS NOT NULL AND sender_id != ''
+            ORDER BY sender_id, timestamp
+        """
+
+        rows = await execute_query_async(adb_config, sql, (start_time, end_time))
+
+        if not rows:
+            return {
+                "promptQuality": _empty_prompt_quality_result(),
+                "userMaturity": {"users": []},
+            }
+
+        # Extract actual user messages (strip metadata)
+        for row in rows:
+            row["user_prompt"] = _extract_user_message(row.get("content_text") or "")
+
+        rows = [row for row in rows if row["user_prompt"]]
+
+        if not rows:
+            print("[L2-4+8] No valid user prompts after metadata extraction")
+            return {
+                "promptQuality": _empty_prompt_quality_result(),
+                "userMaturity": {"users": []},
+            }
+
+        messages = [row["user_prompt"][:500] for row in rows]
+        num_users = len({row["sender_id"] for row in rows})
+        estimated_tokens = count_tokens(messages)
+
+        if estimated_tokens < MAX_BATCH_TOKENS:
+            # Small dataset: single flat batch
+            print(f"[L2-4+8] {len(rows)} msgs / {num_users} users, {estimated_tokens} tokens (< 128K) → single batch")
+
+            def _build_flat_prompt(batch: list[str], start_index: int) -> str:
+                numbered = "\n\n---\n\n".join(f"[{start_index + i + 1}]\n{msg}" for i, msg in enumerate(batch))
+                return _SCORE_USER_PROMPT_TEMPLATE.format(numbered=numbered)
+
+            print(f"[L2-4+8] Scoring {len(messages)} user messages...")
+            results = await llm_client.batch_classify(
+                messages, _PROMPT_QUALITY_SYSTEM_PROMPT, len(messages),
+                _build_flat_prompt, label="L2-4+8:combined",
+            )
+        else:
+            # Large dataset: per-user concurrent scoring
+            print(f"[L2-4+8] {len(rows)} msgs / {num_users} users, {estimated_tokens} tokens (>= 128K) → per-user concurrent (concurrency=5)")
+            results = await _score_prompts_per_user(rows, llm_client, label="L2-4+8", concurrency=5)
+
+        # ── L2-4: Aggregate prompt quality per user ──
+        user_prompt_scores: dict[str, list[dict]] = {}
+        for i, row in enumerate(rows):
+            sender_id = row.get("sender_id") or "unknown"
+            raw_score = results[i] if i < len(results) else dict(_DEFAULT_SCORES)
+            score_entry = {dim: raw_score.get(dim, 1) for dim in _SCORING_DIMENSIONS}
+            score_entry["overall"] = sum(score_entry[d] for d in _SCORING_DIMENSIONS) / len(_SCORING_DIMENSIONS)
+            score_entry["user_prompt"] = row["user_prompt"]
+            score_entry["session_id"] = row["session_id"]
+            score_entry["row_id"] = row["row_id"]
+
+            if sender_id not in user_prompt_scores:
+                user_prompt_scores[sender_id] = []
+            user_prompt_scores[sender_id].append(score_entry)
+
+        # Build per-user summary
+        by_user: list[dict] = []
+        all_dim_avgs: dict[str, list[float]] = {dim: [] for dim in _SCORING_DIMENSIONS}
+
+        for sender_id, entries in user_prompt_scores.items():
+            user_result: dict[str, Any] = {"senderId": sender_id, "promptCount": len(entries)}
+
+            for dim in _SCORING_DIMENSIONS:
+                avg_val = sum(e[dim] for e in entries) / len(entries)
+                user_result[dim] = round(avg_val, 2)
+                all_dim_avgs[dim].append(avg_val)
+
+            user_result["overall"] = round(
+                sum(user_result[d] for d in _SCORING_DIMENSIONS) / len(_SCORING_DIMENSIONS), 2
+            )
+
+            best_entry = max(entries, key=lambda e: e["overall"])
+            user_result["bestPrompt"] = {
+                "sessionId": best_entry["session_id"],
+                "rowId": best_entry["row_id"],
+                "overall": round(best_entry["overall"], 2),
+                "content": best_entry["user_prompt"],
+                "scores": {d: best_entry[d] for d in _SCORING_DIMENSIONS},
+            }
+
+            worst_entry = min(entries, key=lambda e: e["overall"])
+            user_result["worstPrompt"] = {
+                "sessionId": worst_entry["session_id"],
+                "rowId": worst_entry["row_id"],
+                "overall": round(worst_entry["overall"], 2),
+                "content": worst_entry["user_prompt"],
+                "scores": {d: worst_entry[d] for d in _SCORING_DIMENSIONS},
+            }
+
+            by_user.append(user_result)
+
+        by_user.sort(key=lambda u: u["overall"], reverse=True)
+
+        def safe_avg(values: list[float]) -> float:
+            return round(sum(values) / len(values), 2) if values else 0
+
+        team_average: dict[str, float] = {}
+        for dim in _SCORING_DIMENSIONS:
+            team_average[dim] = safe_avg(all_dim_avgs[dim])
+        team_average["overall"] = safe_avg(
+            [sum(all_dim_avgs[d][i] for d in _SCORING_DIMENSIONS) / len(_SCORING_DIMENSIONS)
+             for i in range(len(all_dim_avgs[_SCORING_DIMENSIONS[0]]))]
+        )
+
+        top_users = [
+            {
+                "senderId": u["senderId"],
+                "overall": u["overall"],
+                "bestPrompt": {
+                    "sessionId": u["bestPrompt"]["sessionId"],
+                    "rowId": u["bestPrompt"]["rowId"],
+                    "content": u["bestPrompt"]["content"],
+                    "scores": u["bestPrompt"]["scores"],
+                },
+            }
+            for u in by_user[:3]
+        ]
+
+        bottom_users = [
+            {
+                "senderId": u["senderId"],
+                "overall": u["overall"],
+                "worstPrompt": {
+                    "sessionId": u["worstPrompt"]["sessionId"],
+                    "rowId": u["worstPrompt"]["rowId"],
+                    "content": u["worstPrompt"]["content"],
+                    "scores": u["worstPrompt"]["scores"],
+                },
+            }
+            for u in by_user[-3:]
+        ]
+
+        prompt_quality_result = {
+            "teamAverage": team_average,
+            "byUser": by_user,
+            "topUsers": top_users,
+            "bottomUsers": bottom_users,
+        }
+
+        # ── L2-8: Build per-user daily score timeline ──
+        user_daily_scores: dict[str, dict[str, list[float]]] = {}
+
+        for i, row in enumerate(rows):
+            sender_id = row["sender_id"]
+            day_bucket = str(row["day_bucket"])
+            raw_score = results[i] if i < len(results) else dict(_DEFAULT_SCORES)
+            overall = sum(raw_score.get(dim, 1) for dim in _SCORING_DIMENSIONS) / len(_SCORING_DIMENSIONS)
+
+            if sender_id not in user_daily_scores:
+                user_daily_scores[sender_id] = {}
+            if day_bucket not in user_daily_scores[sender_id]:
+                user_daily_scores[sender_id][day_bucket] = []
+            user_daily_scores[sender_id][day_bucket].append(overall)
+
+        users = []
+        for sender_id, day_data in user_daily_scores.items():
+            sorted_days = sorted(day_data.keys())
+            daily_scores: list[dict] = []
+            all_scores_flat: list[float] = []
+
+            for day_index, day in enumerate(sorted_days):
+                scores_list = day_data[day]
+                avg_score = sum(scores_list) / len(scores_list)
+                daily_scores.append({
+                    "date": day,
+                    "overall": round(avg_score, 2),
+                    "promptCount": len(scores_list),
+                })
+                all_scores_flat.extend(scores_list)
+
+            global_avg = sum(all_scores_flat) / len(all_scores_flat) if all_scores_flat else 0
+            prompt_count = len(all_scores_flat)
+
+            all_high = all(
+                (sum(day_data[d]) / len(day_data[d])) >= _CONSISTENTLY_HIGH_THRESHOLD
+                for d in sorted_days
+            )
+
+            slope = 0.0
+            if len(sorted_days) >= 2:
+                points_x = list(range(len(sorted_days)))
+                points_y = [
+                    sum(day_data[d]) / len(day_data[d]) for d in sorted_days
+                ]
+                n = len(points_x)
+                sum_x = sum(points_x)
+                sum_y = sum(points_y)
+                sum_xy = sum(x * y for x, y in zip(points_x, points_y))
+                sum_xx = sum(x * x for x in points_x)
+                denominator = n * sum_xx - sum_x ** 2
+                if denominator != 0:
+                    slope = (n * sum_xy - sum_x * sum_y) / denominator
+
+            if all_high:
+                trend = "consistently_high"
+            elif slope > 0.1:
+                trend = "improving"
+            elif slope < -0.1:
+                trend = "declining"
+            else:
+                trend = "stable"
+
+            users.append({
+                "senderId": sender_id,
+                "promptCount": prompt_count,
+                "overallAvg": round(global_avg, 2),
+                "dailyScores": daily_scores,
+                "trend": trend,
+                "slope": round(slope, 4),
+            })
+
+        trend_priority = {"improving": 0, "declining": 1, "stable": 2, "consistently_high": 3}
+        users.sort(key=lambda u: (trend_priority.get(u["trend"], 9), -u["slope"]))
+
+        user_maturity_result = {"users": users}
+
+        print(f"[L2-4+8] Completed: {len(user_prompt_scores)} users (quality), {len(users)} users (maturity)")
+        return {
+            "promptQuality": prompt_quality_result,
+            "userMaturity": user_maturity_result,
+        }
+
+    except Exception as error:
+        print(f"[L2-4+8] Combined analysis failed: {error}")
+        return {
+            "promptQuality": _empty_prompt_quality_result(),
+            "userMaturity": {"users": []},
+        }
+
+# ─── Combined: L2-1 + L2-5 + L3-1 (Per-User Aggregated) ───
+_COMBINED_PER_MSG_SYSTEM_PROMPT = """You are analyzing enterprise AI assistant user messages. For each message, simultaneously:
+1. Classify the user's primary intent
+2. Classify the conversation topic with 1-2 tags
+3. Identify all technologies mentioned or implied
+
+### Intent Categories (use language matching the message — Chinese if predominantly Chinese, English if predominantly English):
+代码开发/Code Development, 问题修复/Bug Fixing, 代码优化/Code Optimization, 测试验证/Testing & Validation, 架构设计/Architecture Design, 知识问答/Knowledge Q&A, 配置部署/Configuration & Deployment, 数据分析/Data Analysis, 信息检索/Information Retrieval, 内容生成/Content Generation, 任务管理/Task Management, 工具使用/Tool Usage, 闲聊互动/Casual Interaction, 安全测试/Security Testing, 多媒体处理/Multimedia Processing, 其他/Other
+
+### Topic Categories (same language rule):
+代码开发/Code Development, 问题调试/Debugging, 架构设计/Architecture & Design, 测试验证/Testing, 代码审查/Code Review, 配置部署/DevOps & Deployment, 数据处理/Data & Analytics, 文档写作/Documentation, 项目管理/Project Management, 学习研究/Learning & Research, 工具使用/Tooling, 生活日常/Daily Life, 情感社交/Social & Emotional, 教育学习/Education, 影视音乐/Movies & Music, 游戏电竞/Gaming, 体育运动/Sports, 阅读创作/Reading & Writing, 闲聊互动/Casual Chat, 安全测试/Security Testing, 其他/Miscellaneous
+
+Return a JSON array with one object per message:
+{"intent": "label", "confidence": 0.0-1.0, "topic": "label", "tags": ["tag1"], "technologies": ["React"]}"""
+
+_COMBINED_PER_USER_SYSTEM_PROMPT = """You are analyzing enterprise AI assistant users based on their conversation histories.
+For each user, analyze all their messages and return:
+- intent_counts: estimated distribution of intent types ({"category_label": count})
+- topic_counts: estimated distribution of topic types ({"category_label": count})
+- tags: 2-3 representative lowercase topic tags summarizing the user's main interests
+- technologies: all technology names mentioned or implied in their messages (canonical names)
+
+### Intent Categories (Chinese if predominantly Chinese, English otherwise):
+代码开发/Code Development, 问题修复/Bug Fixing, 代码优化/Code Optimization, 测试验证/Testing & Validation, 架构设计/Architecture Design, 知识问答/Knowledge Q&A, 配置部署/Configuration & Deployment, 数据分析/Data Analysis, 信息检索/Information Retrieval, 内容生成/Content Generation, 任务管理/Task Management, 工具使用/Tool Usage, 闲聊互动/Casual Interaction, 安全测试/Security Testing, 多媒体处理/Multimedia Processing, 其他/Other
+
+### Topic Categories (same language rule):
+代码开发/Code Development, 问题调试/Debugging, 架构设计/Architecture & Design, 测试验证/Testing, 代码审查/Code Review, 配置部署/DevOps & Deployment, 数据处理/Data & Analytics, 文档写作/Documentation, 项目管理/Project Management, 学习研究/Learning & Research, 工具使用/Tooling, 生活日常/Daily Life, 情感社交/Social & Emotional, 教育学习/Education, 影视音乐/Movies & Music, 游戏电竞/Gaming, 体育运动/Sports, 阅读创作/Reading & Writing, 闲聊互动/Casual Chat, 安全测试/Security Testing, 其他/Miscellaneous
+
+Return a JSON array with one object per user (same order as input):
+{"user_id": "string", "intent_counts": {"代码开发": 5}, "topic_counts": {"配置部署": 3}, "tags": ["docker"], "technologies": ["Docker"]}"""
+
+
+def _build_top_tags(tag_counts: dict[str, dict]) -> list[dict]:
+    """Build and deduplicate top tags using Jaccard similarity."""
+    merged_tags: dict[str, dict] = {}
+    processed: set[str] = set()
+
+    for tag, data in tag_counts.items():
+        if tag in processed:
+            continue
+        merged = {"count": data["count"], "users": set(data["users"]), "category": data["category"]}
+        processed.add(tag)
+        for other_tag, other_data in tag_counts.items():
+            if other_tag in processed:
+                continue
+            if _string_jaccard(tag, other_tag) > 0.8:
+                merged["count"] += other_data["count"]
+                merged["users"].update(other_data["users"])
+                processed.add(other_tag)
+        merged_tags[tag] = merged
+
+    return sorted(
+        [
+            {"tag": t, "category": d["category"], "count": d["count"], "uniqueUsers": len(d["users"])}
+            for t, d in merged_tags.items()
+        ],
+        key=lambda x: x["count"],
+        reverse=True,
+    )[:30]
+
+
+async def _combined_per_message(rows: list[dict], llm_client: LlmClient) -> dict:
+    """Small dataset path: one LLM batch returning intent+topic+tech per message."""
+    messages = [r["msg_text"][:500] for r in rows]
+    print(f"[Combined:per-msg] {len(messages)} messages → single batch")
+
+    def build_user_prompt(batch: list[str], start_index: int) -> str:
+        numbered = "\n\n---\n\n".join(f"[{start_index + i + 1}]\n{msg}" for i, msg in enumerate(batch))
+        return (
+            f"Analyze these {len(batch)} user messages for intent, topic, and technologies.\n\n"
+            f"{numbered}\n\n"
+            f"Return a JSON array with one object per message: "
+            f"{{intent, confidence, topic, tags[], technologies[]}}"
+        )
+
+    results = await llm_client.batch_classify(
+        messages, _COMBINED_PER_MSG_SYSTEM_PROMPT, len(messages),
+        build_user_prompt, label="combined:per-msg",
+    )
+
+    intent_dist: dict[str, int] = {}
+    intent_by_user: dict[str, dict[str, int]] = {}
+    intent_senders_by_cat: dict[str, set] = {}
+    intent_items: list[dict] = []
+
+    topic_cat_dist: dict[str, int] = {}
+    topic_tag_counts: dict[str, dict] = {}
+    topic_by_user: dict[str, dict[str, int]] = {}
+
+    tech_users: dict[str, set[str]] = {}
+    tech_sessions: dict[str, set[str]] = {}
+
+    for i, row in enumerate(rows):
+        res = results[i] if i < len(results) else {}
+        sender_id = row["sender_id"]
+        session_id = row["session_id"]
+
+        intent_cat = res.get("intent", "其他")
+        confidence = float(res.get("confidence", 0))
+        intent_dist[intent_cat] = intent_dist.get(intent_cat, 0) + 1
+        if sender_id not in intent_by_user:
+            intent_by_user[sender_id] = {}
+        intent_by_user[sender_id][intent_cat] = intent_by_user[sender_id].get(intent_cat, 0) + 1
+        if intent_cat not in intent_senders_by_cat:
+            intent_senders_by_cat[intent_cat] = set()
+        intent_senders_by_cat[intent_cat].add(sender_id)
+        intent_items.append({
+            "rowId": row["row_id"], "sessionId": session_id, "senderId": sender_id,
+            "category": intent_cat, "confidence": confidence, "preview": row["msg_text"][:100],
+        })
+
+        topic_cat = res.get("topic", "其他")
+        tags = res.get("tags", [])
+        topic_cat_dist[topic_cat] = topic_cat_dist.get(topic_cat, 0) + 1
+        if sender_id not in topic_by_user:
+            topic_by_user[sender_id] = {}
+        topic_by_user[sender_id][topic_cat] = topic_by_user[sender_id].get(topic_cat, 0) + 1
+        for tag in tags:
+            norm = tag.lower().strip()
+            if not norm:
+                continue
+            if norm not in topic_tag_counts:
+                topic_tag_counts[norm] = {"count": 0, "users": set(), "category": topic_cat}
+            topic_tag_counts[norm]["count"] += 1
+            topic_tag_counts[norm]["users"].add(sender_id)
+
+        for tech in res.get("technologies", []):
+            if not isinstance(tech, str) or not tech.strip():
+                continue
+            t = tech.strip()
+            if t not in tech_sessions:
+                tech_sessions[t] = set()
+                tech_users[t] = set()
+            tech_sessions[t].add(session_id)
+            tech_users[t].add(sender_id)
+
+    print(f"[Combined:per-msg] intents={len(intent_dist)}, topics={len(topic_cat_dist)}, techs={len(tech_sessions)}")
+    return {
+        "intents": {
+            "distribution": intent_dist,
+            "byUser": intent_by_user,
+            "sendersByCategory": {c: sorted(s) for c, s in intent_senders_by_cat.items()},
+            "items": intent_items,
+        },
+        "topics": {
+            "categoryDistribution": topic_cat_dist,
+            "topTags": _build_top_tags(topic_tag_counts),
+            "byUser": topic_by_user,
+        },
+        "tech_stack": {
+            "technologies": sorted(
+                [{"tech": t, "sessionCount": len(s), "uniqueUsers": len(tech_users[t])}
+                 for t, s in tech_sessions.items()],
+                key=lambda x: x["sessionCount"], reverse=True,
+            )
+        },
+    }
+
+
+async def _combined_per_user(rows: list[dict], llm_client: LlmClient) -> dict:
+    """Large dataset path: group by user, batching multiple users per LLM request."""
+    user_rows: dict[str, list[dict]] = {}
+    for row in rows:
+        uid = row["sender_id"]
+        if uid not in user_rows:
+            user_rows[uid] = []
+        user_rows[uid].append(row)
+
+    user_ids = list(user_rows.keys())
+    user_sessions_map: dict[str, set[str]] = {
+        uid: {r["session_id"] for r in u_rows} for uid, u_rows in user_rows.items()
+    }
+
+    user_context: dict[str, str] = {}
+    user_tokens: dict[str, int] = {}
+    for uid in user_ids:
+        snippets = [f"[{j+1}] {r['msg_text'][:500]}" for j, r in enumerate(user_rows[uid])]
+        ctx = f"user_id: {uid}\n" + "\n".join(snippets)
+        user_context[uid] = ctx
+        user_tokens[uid] = count_tokens_single(ctx)
+
+    total_tokens = sum(user_tokens.values())
+    batches = _make_token_bounded_batches(user_ids, user_tokens)
+    total_batches = len(batches)
+    print(
+        f"[Combined:per-user] {len(user_ids)} users, {total_tokens} tokens → "
+        f"{total_batches} batches (token-bounded, concurrency=5)"
+    )
+
+    results: list[dict] = [{}] * len(user_ids)
+    uid_to_idx = {uid: i for i, uid in enumerate(user_ids)}
+    sem = asyncio.Semaphore(5)
+    completed = 0
+
+    async def process_batch(batch_uids: list[str], batch_num: int) -> None:
+        nonlocal completed
+        combined = "\n\n===\n\n".join(user_context[uid] for uid in batch_uids)
+        user_prompt = (
+            f"Analyze these {len(batch_uids)} users' conversation histories.\n\n"
+            f"{combined}\n\n"
+            f"Return a JSON array with one object per user (same order as input): "
+            f"{{user_id, intent_counts, topic_counts, tags[], technologies[]}}"
+        )
+        async with sem:
+            try:
+                raw = await llm_client.chat_json(_COMBINED_PER_USER_SYSTEM_PROMPT, user_prompt)
+                if not isinstance(raw, list):
+                    raw = [{}] * len(batch_uids)
+            except Exception as exc:
+                print(f"[Combined:per-user] Batch {batch_num} failed: {exc}")
+                raw = []
+
+            completed += 1
+            print(
+                f"[Combined:per-user] Batch {completed}/{total_batches} done "
+                f"(users={len(batch_uids)}, ids={','.join(batch_uids)})"
+            )
+
+        for j, uid in enumerate(batch_uids):
+            results[uid_to_idx[uid]] = raw[j] if j < len(raw) else {}
+
+    await asyncio.gather(*[process_batch(batch, i + 1) for i, batch in enumerate(batches)])
+
+    intent_dist: dict[str, int] = {}
+    intent_by_user: dict[str, dict[str, int]] = {}
+    intent_senders_by_cat: dict[str, set] = {}
+
+    topic_cat_dist: dict[str, int] = {}
+    topic_tag_counts: dict[str, dict] = {}
+    topic_by_user: dict[str, dict[str, int]] = {}
+
+    tech_users: dict[str, set[str]] = {}
+    tech_sessions: dict[str, set[str]] = {}
+
+    for i, uid in enumerate(user_ids):
+        res = results[i] if i < len(results) else {}
+        u_sessions = user_sessions_map[uid]
+
+        intent_counts = res.get("intent_counts") or {}
+        if not isinstance(intent_counts, dict):
+            intent_counts = {}
+        intent_by_user[uid] = intent_counts
+        for cat, cnt in intent_counts.items():
+            intent_dist[cat] = intent_dist.get(cat, 0) + int(cnt)
+            if cat not in intent_senders_by_cat:
+                intent_senders_by_cat[cat] = set()
+            intent_senders_by_cat[cat].add(uid)
+
+        topic_counts = res.get("topic_counts") or {}
+        if not isinstance(topic_counts, dict):
+            topic_counts = {}
+        topic_by_user[uid] = topic_counts
+        for cat, cnt in topic_counts.items():
+            topic_cat_dist[cat] = topic_cat_dist.get(cat, 0) + int(cnt)
+        dominant_cat = max(topic_counts, key=lambda c: topic_counts[c]) if topic_counts else "其他"
+        for tag in res.get("tags", []):
+            norm = tag.lower().strip()
+            if not norm:
+                continue
+            if norm not in topic_tag_counts:
+                topic_tag_counts[norm] = {"count": 0, "users": set(), "category": dominant_cat}
+            topic_tag_counts[norm]["count"] += 1
+            topic_tag_counts[norm]["users"].add(uid)
+
+        for tech in res.get("technologies", []):
+            if not isinstance(tech, str) or not tech.strip():
+                continue
+            t = tech.strip()
+            if t not in tech_sessions:
+                tech_sessions[t] = set()
+                tech_users[t] = set()
+            tech_sessions[t].update(u_sessions)
+            tech_users[t].add(uid)
+
+    print(f"[Combined:per-user] intents={len(intent_dist)}, topics={len(topic_cat_dist)}, techs={len(tech_sessions)}")
+    return {
+        "intents": {
+            "distribution": intent_dist,
+            "byUser": intent_by_user,
+            "sendersByCategory": {c: sorted(s) for c, s in intent_senders_by_cat.items()},
+            "items": [],  # no per-row items in per-user mode
+        },
+        "topics": {
+            "categoryDistribution": topic_cat_dist,
+            "topTags": _build_top_tags(topic_tag_counts),
+            "byUser": topic_by_user,
+        },
+        "tech_stack": {
+            "technologies": sorted(
+                [{"tech": t, "sessionCount": len(s), "uniqueUsers": len(tech_users[t])}
+                 for t, s in tech_sessions.items()],
+                key=lambda x: x["sessionCount"], reverse=True,
+            )
+        },
+    }
+
+
+async def classify_messages_combined(
+    adb_config: AdbConfig,
+    table_name: str,
+    range_: TimeRange,
+    llm_client: LlmClient,
+    max_items: int = 500,
+) -> dict:
+    """Combined analysis for L2-1 (intents), L2-5 (topics), and L3-1 (tech stack).
+
+    Discards unknown users (null/empty sender_id).
+    - Small datasets (estimated < 128K tokens at 2.5 tokens/char): one batch, per-message analysis.
+    - Large datasets: group by user, truncate each message to 500 chars, one batch per user group.
+
+    Returns dict with keys 'intents', 'topics', 'tech_stack'.
+    """
+    _empty: dict = {
+        "intents": {"distribution": {}, "byUser": {}, "sendersByCategory": {}, "items": []},
+        "topics": {"categoryDistribution": {}, "topTags": [], "byUser": {}},
+        "tech_stack": {"technologies": []},
+    }
+    print("[Combined] Starting combined L2-1+L2-5+L3-1 analysis (per-user aggregation)...")
+
+    try:
+        start_time, end_time = time_range_to_sql_params(range_)
+        sql = f"""
+            SELECT row_id, session_id, sender_id, content_text
+            FROM `{table_name}`
+            WHERE role = 'user'
+              AND timestamp >= %s AND timestamp < %s
+              AND content_text IS NOT NULL AND content_text != ''
+              AND sender_id IS NOT NULL AND sender_id != ''
+            ORDER BY sender_id, session_id, timestamp
+            LIMIT %s
+        """
+        rows = await execute_query_async(adb_config, sql, (start_time, end_time, max_items))
+
+        if not rows:
+            print("[Combined] No valid user messages found")
+            return _empty
+
+        for row in rows:
+            row["msg_text"] = _extract_user_message(row.get("content_text") or "")
+        rows = [r for r in rows if r["msg_text"]]
+
+        if not rows:
+            print("[Combined] No valid messages after metadata extraction")
+            return _empty
+
+        messages = [r["msg_text"] for r in rows]
+        estimated_tokens = count_tokens(messages)
+        print(f"[Combined] {len(rows)} messages from {len({r['sender_id'] for r in rows})} users, "
+              f"{estimated_tokens} estimated tokens")
+
+        if estimated_tokens < MAX_BATCH_TOKENS:
+            return await _combined_per_message(rows, llm_client)
+        else:
+            return await _combined_per_user(rows, llm_client)
+
+    except Exception as error:
+        print(f"[Combined] Combined analysis failed: {error}")
+        return _empty
 
 
 # ─── Main L2 Analysis Runner ───

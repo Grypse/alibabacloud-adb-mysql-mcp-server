@@ -46,6 +46,7 @@
     "enableL2": true,
     "enableL3": true,
     "analysisWindowDays": 7,
-    "maxSessionsForLlm": 500
+    "maxSessionsForLlm": 500,
+    "generateHtmlReport": false
   }
 }
